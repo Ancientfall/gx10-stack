@@ -531,6 +531,140 @@ def vllm_logs(lines=120):
 
 
 # ------------------------------------------------------------
+# Model management: curated list, HF search, cache, fit, test
+# ------------------------------------------------------------
+
+# Curated GB10-friendly models. Edit freely. params_b = billions of params.
+CURATED_MODELS = [
+    {"id": "openai/gpt-oss-120b", "params_b": 120, "note": "MoE, mxfp4. Strong general + reasoning.", "gated": False},
+    {"id": "openai/gpt-oss-20b", "params_b": 20, "note": "Smaller gpt-oss. Fast, single-node capable.", "gated": False},
+    {"id": "Qwen/Qwen3-72B-Instruct", "params_b": 72, "note": "Strong all-rounder, long context.", "gated": False},
+    {"id": "Qwen/Qwen3-32B", "params_b": 32, "note": "Fast, fits comfortably.", "gated": False},
+    {"id": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "params_b": 30, "note": "MoE coder, low active params.", "gated": False},
+    {"id": "meta-llama/Llama-3.3-70B-Instruct", "params_b": 70, "note": "Meta flagship. Needs HF token.", "gated": True},
+    {"id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506", "params_b": 24, "note": "Efficient, capable.", "gated": False},
+]
+
+# Pooled memory budget across both GB10s (GB). 128 each, reserve headroom.
+POOLED_GB = 256
+USABLE_GB = 205          # after OS + KV cache + activation overhead
+SINGLE_NODE_GB = 110     # what fits on one box alone
+
+
+def _fit_label(params_b, quantized=True):
+    """Rough footprint: ~1 byte/param for fp8/mxfp4, ~2 for fp16. Plus KV/activation slack."""
+    bytes_per = 1.0 if quantized else 2.0
+    weight_gb = params_b * bytes_per
+    footprint = weight_gb * 1.25  # KV cache + activations headroom
+    if footprint <= SINGLE_NODE_GB:
+        return {"fit": "single", "footprint_gb": round(footprint), "note": "Fits on one node (fastest)."}
+    if footprint <= USABLE_GB:
+        return {"fit": "cluster", "footprint_gb": round(footprint), "note": "Needs both nodes (TP=2)."}
+    return {"fit": "toobig", "footprint_gb": round(footprint), "note": "Exceeds pooled memory."}
+
+
+def hf_cache_models() -> list:
+    """List models already downloaded to HF_CACHE_DIR (so switching is fast)."""
+    c = cfg()
+    cache = Path(c.get("HF_CACHE_DIR", "")) / "hub"
+    out = []
+    if cache.is_dir():
+        for d in cache.glob("models--*"):
+            # models--org--name -> org/name
+            name = d.name.replace("models--", "").replace("--", "/", 1).replace("--", "-")
+            size_gb = None
+            try:
+                total = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                size_gb = round(total / 1e9, 1)
+            except Exception:
+                pass
+            out.append({"id": name, "size_gb": size_gb})
+    return out
+
+
+def curated_models() -> list:
+    cached = {m["id"] for m in hf_cache_models()}
+    current = cfg().get("MODEL", "")
+    result = []
+    for m in CURATED_MODELS:
+        fit = _fit_label(m["params_b"])
+        result.append({**m, **fit, "cached": m["id"] in cached, "active": m["id"] == current})
+    return result
+
+
+def hf_search(query: str, limit: int = 12) -> list:
+    """Live Hugging Face model search. Public API, no auth needed for public models."""
+    if not query.strip():
+        return []
+    url = f"https://huggingface.co/api/models?search={query}&filter=text-generation&sort=downloads&direction=-1&limit={limit}"
+    rc, body, _ = run(["curl", "-s", "--max-time", "8", url], timeout=12)
+    if rc != 0 or not body:
+        return []
+    try:
+        items = json.loads(body)
+    except Exception:
+        return []
+    cached = {m["id"] for m in hf_cache_models()}
+    results = []
+    for it in items:
+        mid = it.get("id") or it.get("modelId") or ""
+        if not mid:
+            continue
+        # estimate params from the name (e.g. "-70B", "-7b", "-A3B")
+        params_b = _guess_params_from_name(mid)
+        fit = _fit_label(params_b) if params_b else {"fit": "unknown", "footprint_gb": None, "note": "Size unknown; check model card."}
+        results.append({
+            "id": mid,
+            "downloads": it.get("downloads", 0),
+            "likes": it.get("likes", 0),
+            "gated": bool(it.get("gated", False)),
+            "params_b": params_b,
+            "cached": mid in cached,
+            **fit,
+        })
+    return results
+
+
+def _guess_params_from_name(name: str):
+    """Best-effort parameter count from a model id like 'Qwen/Qwen3-72B-Instruct'."""
+    import re as _re
+    m = _re.search(r'(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])', name)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def test_prompt(prompt: str, max_tokens: int = 128) -> dict:
+    """Send one prompt to the live model and time it, for a quick speed/health probe."""
+    c = cfg()
+    model = c.get("MODEL", "")
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    })
+    t0 = time.time()
+    rc, body, _ = run(["curl", "-s", "--max-time", "180",
+                       f"http://localhost:{c['API_PORT']}/v1/chat/completions",
+                       "-H", "Content-Type: application/json", "-d", payload], timeout=185)
+    elapsed = time.time() - t0
+    if rc != 0 or not body:
+        return {"ok": False, "detail": "No response. Is a model loaded and serving?"}
+    try:
+        data = json.loads(body)
+        text = data["choices"][0]["message"]["content"]
+        completion = data.get("usage", {}).get("completion_tokens", max_tokens)
+        tps = round(completion / elapsed, 1) if elapsed > 0 else 0
+        return {"ok": True, "model": model, "text": text, "tokens": completion,
+                "seconds": round(elapsed, 2), "tps": tps}
+    except Exception as exc:
+        return {"ok": False, "detail": f"Parse error: {exc}"}
+
+
+# ------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------
 app = FastAPI(title="GX10 Cluster Panel")
@@ -604,6 +738,30 @@ def api_model(payload: dict = Body(...)):
     if not model:
         return JSONResponse({"ok": False, "detail": "No model provided"}, status_code=400)
     return JSONResponse(swap_model(model))
+
+
+@app.get("/api/models/curated")
+def api_models_curated():
+    return JSONResponse({"models": curated_models(), "budget": {
+        "pooled_gb": POOLED_GB, "usable_gb": USABLE_GB, "single_node_gb": SINGLE_NODE_GB}})
+
+
+@app.get("/api/models/cached")
+def api_models_cached():
+    return JSONResponse({"models": hf_cache_models()})
+
+
+@app.get("/api/models/search")
+def api_models_search(q: str = ""):
+    return JSONResponse({"results": hf_search(q)})
+
+
+@app.post("/api/models/test")
+def api_models_test(payload: dict = Body(...)):
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse({"ok": False, "detail": "No prompt provided"}, status_code=400)
+    return JSONResponse(test_prompt(prompt, int(payload.get("max_tokens", 128))))
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

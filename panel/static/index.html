@@ -158,6 +158,36 @@
   .gfill.hot { background: var(--warn); }
   .gfill.crit { background: var(--err); }
   .gpct { font-family: var(--mono); font-size: 12px; color: var(--muted); width: 64px; text-align: right; flex: none; }
+
+  /* models section */
+  .hidden { display: none; }
+  .modeltabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .mtab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 14px; color: var(--muted); font-size: 13px; font-weight: 600; }
+  .mtab:hover { color: var(--text); border-color: transparent; }
+  .mtab.active { color: var(--fabric); border-bottom-color: var(--fabric); }
+  .mpane { margin-bottom: 26px; }
+  .mlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+  .mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 15px; display: flex; flex-direction: column; gap: 8px; }
+  .mcard.active { border-color: var(--up); box-shadow: inset 0 0 0 1px var(--up); }
+  .mcard .mid { font-family: var(--mono); font-size: 13px; font-weight: 600; word-break: break-all; }
+  .mcard .mmeta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .tag { font-size: 10.5px; font-family: var(--mono); padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.single { color: var(--up); border-color: var(--up); }
+  .tag.cluster { color: var(--fabric); border-color: var(--fabric-dim); }
+  .tag.toobig { color: var(--err); border-color: #5a2a28; }
+  .tag.unknown { color: var(--dim); }
+  .tag.cached { color: var(--accent); border-color: var(--accent); }
+  .tag.gated { color: var(--warn); border-color: var(--warn); }
+  .mcard .mnote { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+  .mcard .mact { display: flex; gap: 8px; margin-top: 2px; }
+  .mcard .mact button { padding: 7px 14px; font-size: 12.5px; }
+  .searchrow { display: flex; gap: 8px; margin-bottom: 8px; }
+  .searchrow input { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: 13px; padding: 9px 11px; }
+  .searchrow input:focus-visible { outline: 2px solid var(--accent); border-color: var(--accent); }
+  .testresult { background: #070b0f; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-top: 12px; }
+  .testresult .tr-stats { display: flex; gap: 16px; margin-bottom: 10px; font-family: var(--mono); font-size: 12px; }
+  .testresult .tr-stats b { color: var(--fabric); }
+  .testresult .tr-text { font-size: 13.5px; line-height: 1.5; color: var(--text); white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -262,6 +292,44 @@
         <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
       </div>
     </div>
+  </div>
+
+  <h2 class="sec">Models</h2>
+  <div class="modeltabs" role="tablist">
+    <button class="mtab active" id="tab-curated" role="tab">Favorites</button>
+    <button class="mtab" id="tab-search" role="tab">Discover</button>
+    <button class="mtab" id="tab-library" role="tab">Library</button>
+    <button class="mtab" id="tab-test" role="tab">Test</button>
+  </div>
+
+  <div class="mpane" id="pane-curated">
+    <p class="hint" id="budget-line">Loading model budget...</p>
+    <div class="mlist" id="curated-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-search">
+    <div class="searchrow">
+      <input id="search-input" type="text" placeholder="Search Hugging Face, e.g. qwen coder, llama 70b" spellcheck="false" />
+      <button id="search-btn" aria-label="Search models">Search</button>
+    </div>
+    <p class="hint">Footprint estimates are rough (parsed from the model name). Always check the model card for exact size and license.</p>
+    <div class="mlist" id="search-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-library">
+    <p class="hint">Models already downloaded to your cache. Switching to a cached model skips the download.</p>
+    <div class="mlist" id="library-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-test">
+    <div class="field">
+      <label for="test-prompt">Prompt</label>
+      <input id="test-prompt" type="text" value="In one sentence, what is offshore vessel logistics?" spellcheck="false" />
+    </div>
+    <div class="actions">
+      <button id="test-btn" aria-label="Send test prompt">Send to active model</button>
+    </div>
+    <div class="testresult hidden" id="test-result"></div>
   </div>
 
 </div>
@@ -405,6 +473,104 @@ $("btn-vllm-logs").onclick = async () => {
   c.scrollTop = c.scrollHeight;
 };
 $("btn-clear").onclick = () => { $("console").innerHTML = ""; };
+
+// ---------- Models section ----------
+const fitTag = (m) => {
+  const map = { single: "single node", cluster: "needs both nodes", toobig: "too large", unknown: "size unknown" };
+  const fp = m.footprint_gb ? ` ~${m.footprint_gb}GB` : "";
+  return `<span class="tag ${m.fit}">${map[m.fit] || m.fit}${fp}</span>`;
+};
+
+const modelCard = (m, opts = {}) => {
+  const tags = [fitTag(m)];
+  if (m.cached) tags.push('<span class="tag cached">cached</span>');
+  if (m.gated) tags.push('<span class="tag gated">gated</span>');
+  if (opts.downloads != null) tags.push(`<span class="tag">${fmtNum(m.downloads)} downloads</span>`);
+  const canLoad = m.fit !== "toobig";
+  const loadBtn = m.active
+    ? '<span class="tag single">active</span>'
+    : (canLoad ? `<button data-model="${m.id}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "");
+  const note = m.note ? `<div class="mnote">${m.note}</div>` : "";
+  return `<div class="mcard ${m.active ? "active" : ""}">
+    <div class="mid">${m.id}</div>
+    <div class="mmeta">${tags.join("")}</div>
+    ${note}
+    <div class="mact">${loadBtn}</div>
+  </div>`;
+};
+
+const wireLoadButtons = (container) => {
+  container.querySelectorAll(".load-model").forEach((btn) => {
+    btn.onclick = async () => {
+      const model = btn.getAttribute("data-model");
+      if (!confirm(`Load ${model}? This swaps the active model and takes a few minutes${btn.textContent.includes("Download") ? " (plus download time)" : ""}.`)) return;
+      btn.disabled = true; btn.textContent = "Loading...";
+      const r = await api("/api/model", "POST", { model });
+      toast(r.detail);
+      pollActivity();
+      setTimeout(loadCurated, 1500);
+    };
+  });
+};
+
+const loadCurated = async () => {
+  const r = await api("/api/models/curated");
+  const b = r.budget;
+  $("budget-line").textContent = `Pooled memory ~${b.pooled_gb}GB across both nodes, ~${b.usable_gb}GB usable. Single node holds ~${b.single_node_gb}GB. Estimates are approximate.`;
+  const list = $("curated-list");
+  list.innerHTML = r.models.map((m) => modelCard(m)).join("");
+  wireLoadButtons(list);
+};
+
+const loadLibrary = async () => {
+  const r = await api("/api/models/cached");
+  const list = $("library-list");
+  if (!r.models.length) { list.innerHTML = '<p class="hint">No models cached yet. Load one from Favorites or Discover.</p>'; return; }
+  const current = ($("f-model").value || "").trim();
+  list.innerHTML = r.models.map((m) => modelCard(
+    { id: m.id, fit: "unknown", footprint_gb: null, cached: true, active: m.id === current, note: m.size_gb ? `${m.size_gb}GB on disk` : "" }
+  )).join("");
+  wireLoadButtons(list);
+};
+
+const runSearch = async () => {
+  const q = $("search-input").value.trim();
+  if (!q) return;
+  $("search-list").innerHTML = '<p class="hint">Searching Hugging Face...</p>';
+  const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
+  const list = $("search-list");
+  if (!r.results.length) { list.innerHTML = '<p class="hint">No results. Try different terms.</p>'; return; }
+  list.innerHTML = r.results.map((m) => modelCard(m, { downloads: m.downloads })).join("");
+  wireLoadButtons(list);
+};
+$("search-btn").onclick = runSearch;
+$("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+$("test-btn").onclick = async () => {
+  const prompt = $("test-prompt").value.trim();
+  if (!prompt) return toast("Enter a prompt.");
+  const btn = $("test-btn"); btn.disabled = true; btn.textContent = "Running...";
+  const res = $("test-result"); res.classList.remove("hidden");
+  res.innerHTML = '<p class="hint">Waiting for the model...</p>';
+  const r = await api("/api/models/test", "POST", { prompt, max_tokens: 128 });
+  btn.disabled = false; btn.textContent = "Send to active model";
+  if (!r.ok) { res.innerHTML = `<p class="hint">${r.detail}</p>`; return; }
+  res.innerHTML = `<div class="tr-stats"><span><b>${r.tps}</b> tok/s</span><span><b>${r.tokens}</b> tokens</span><span><b>${r.seconds}</b>s</span><span>${r.model}</span></div><div class="tr-text">${r.text.replace(/</g, "&lt;")}</div>`;
+};
+
+// tab switching
+const tabs = { curated: "pane-curated", search: "pane-search", library: "pane-library", test: "pane-test" };
+Object.keys(tabs).forEach((k) => {
+  $(`tab-${k}`).onclick = () => {
+    Object.keys(tabs).forEach((j) => {
+      $(`tab-${j}`).classList.toggle("active", j === k);
+      $(tabs[j]).classList.toggle("hidden", j !== k);
+    });
+    if (k === "library") loadLibrary();
+  };
+});
+
+loadCurated();
 
 const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
 
