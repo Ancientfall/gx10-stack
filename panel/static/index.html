@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GX10 Cluster Control</title>
+<style>
+  :root {
+    --bg: #090d12;
+    --panel: #111823;
+    --raised: #18212e;
+    --line: #243040;
+    --text: #e6edf3;
+    --muted: #8a97a8;
+    --dim: #5b6675;
+    --up: #3fb950;
+    --warn: #d6a032;
+    --err: #f0564b;
+    --fabric: #2dd4bf;
+    --fabric-dim: #135e57;
+    --accent: #4ea1f0;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  body {
+    min-height: 100vh;
+    background-image: radial-gradient(circle at 20% -10%, #13202e 0%, transparent 45%),
+                      radial-gradient(circle at 90% 0%, #10201d 0%, transparent 40%);
+    padding: 28px 20px 60px;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
+  .title { font-size: 13px; letter-spacing: 0.32em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .title b { color: var(--text); }
+  .clock { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+
+  /* ---------- signature: the fabric link hero ---------- */
+  .fabric {
+    position: relative;
+    margin: 20px 0 26px;
+    padding: 30px 26px;
+    background: linear-gradient(180deg, var(--panel), #0d141d);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 18px;
+    overflow: hidden;
+  }
+  .node { text-align: center; }
+  .node .role { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); }
+  .node .name { font-family: var(--mono); font-size: 22px; font-weight: 600; margin: 4px 0 2px; }
+  .node .ip { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .node .chip {
+    display: inline-flex; align-items: center; gap: 6px; margin-top: 10px;
+    font-size: 11px; font-family: var(--mono); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.up { background: var(--up); box-shadow: 0 0 10px var(--up); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+  .dot.err { background: var(--err); box-shadow: 0 0 10px var(--err); }
+
+  .link { position: relative; width: 200px; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .link .wire { position: relative; width: 100%; height: 3px; border-radius: 3px; background: var(--fabric-dim); overflow: hidden; }
+  .link .wire::after {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(90deg, transparent 0 10px, var(--fabric) 10px 22px);
+    opacity: 0; animation: flow 1.1s linear infinite;
+  }
+  .link.live .wire { background: var(--fabric); box-shadow: 0 0 16px var(--fabric-dim); }
+  .link.live .wire::after { opacity: 0.85; }
+  .link.degraded .wire { background: var(--warn); }
+  .link.down .wire { background: var(--err); }
+  @keyframes flow { from { transform: translateX(-22px); } to { transform: translateX(0); } }
+  .link .speed { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 9px; letter-spacing: 0.08em; }
+  @media (prefers-reduced-motion: reduce) { .link .wire::after { animation: none; } }
+
+  /* ---------- overall status + primary actions ---------- */
+  .bar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  .verdict { display: flex; align-items: center; gap: 11px; font-size: 15px; }
+  .verdict .big { width: 11px; height: 11px; border-radius: 50%; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font-family: var(--sans); font-size: 14px; font-weight: 600; color: var(--text);
+    background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 18px; cursor: pointer; transition: border-color .15s, background .15s, transform .05s;
+  }
+  button:hover { border-color: var(--dim); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--up); border-color: var(--up); color: #06140a; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { border-color: #5a2a28; color: #f5a6a0; }
+  button.danger:hover { border-color: var(--err); }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -2px; margin-right: 7px; animation: rot .7s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+
+  /* ---------- check grid ---------- */
+  h2.sec { font-size: 11px; letter-spacing: 0.26em; text-transform: uppercase; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 12px; margin-bottom: 26px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 15px; border-left: 3px solid var(--dim); }
+  .card.ok { border-left-color: var(--up); }
+  .card.warn { border-left-color: var(--warn); }
+  .card.error { border-left-color: var(--err); }
+  .card.idle { border-left-color: var(--dim); }
+  .card .label { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .card .detail { font-size: 12.5px; color: var(--muted); margin-top: 6px; line-height: 1.45; font-family: var(--mono); }
+
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 760px) { .columns { grid-template-columns: 1fr; } .fabric { grid-template-columns: 1fr; } .link { width: 100%; transform: rotate(90deg) scale(0.8); margin: 8px 0; } }
+
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 22px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+  .field input {
+    width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); font-family: var(--mono); font-size: 13px; padding: 9px 11px;
+  }
+  .field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  .console {
+    background: #070b0f; border: 1px solid var(--line); border-radius: 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    padding: 12px 14px; height: 260px; overflow-y: auto; color: #b9c4d2;
+  }
+  .console .t { color: var(--dim); margin-right: 8px; }
+  .console .l-error { color: var(--err); }
+  .console .l-optimize { color: var(--fabric); }
+  .console .l-model { color: var(--accent); }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  .hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="title"><b>GX10</b> cluster control</div>
+    <div class="clock" id="clock"></div>
+  </header>
+
+  <!-- signature: live fabric link between the two boxes -->
+  <section class="fabric" aria-label="Cluster fabric status">
+    <div class="node">
+      <div class="role">Head node</div>
+      <div class="name" id="head-name">myspark</div>
+      <div class="ip" id="head-ip">192.168.100.10</div>
+      <div class="chip"><span class="dot" id="head-dot"></span><span id="head-iface">enp1s0f1np1</span></div>
+    </div>
+    <div class="link" id="link">
+      <div class="wire"></div>
+      <div class="speed" id="link-speed">ConnectX-7</div>
+    </div>
+    <div class="node">
+      <div class="role">Worker node</div>
+      <div class="name" id="worker-name">myspark2</div>
+      <div class="ip" id="worker-ip">192.168.100.11</div>
+      <div class="chip"><span class="dot" id="worker-dot"></span><span id="worker-host">myspark2</span></div>
+    </div>
+  </section>
+
+  <div class="bar">
+    <div class="verdict" aria-live="polite">
+      <span class="big dot" id="verdict-dot"></span>
+      <span id="verdict-text">Checking cluster...</span>
+    </div>
+    <div class="actions">
+      <button class="primary" id="btn-start" aria-label="Start cluster">Start cluster</button>
+      <button class="danger" id="btn-stop" aria-label="Stop cluster">Stop</button>
+      <button id="btn-optimize" aria-label="Optimize and fix configuration">Optimize &amp; fix</button>
+    </div>
+  </div>
+
+  <h2 class="sec">Configuration checks</h2>
+  <div class="grid" id="checks"></div>
+
+  <div class="columns">
+    <div>
+      <h2 class="sec">Serving config</h2>
+      <div class="pane">
+        <div class="field">
+          <label for="f-model">Model</label>
+          <input id="f-model" type="text" spellcheck="false" />
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="f-tp">Tensor parallel</label>
+            <input id="f-tp" type="number" min="1" max="2" />
+          </div>
+          <div class="field">
+            <label for="f-util">GPU mem util</label>
+            <input id="f-util" type="number" step="0.01" min="0.4" max="0.95" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-len">Max model length</label>
+          <input id="f-len" type="number" step="1024" />
+        </div>
+        <div class="actions">
+          <button id="btn-save" aria-label="Save serving config">Save config</button>
+          <button id="btn-reload" aria-label="Reload model now">Reload model now</button>
+          <button id="btn-rdma" aria-label="Check RDMA transport">Check RDMA</button>
+        </div>
+        <p class="hint">Save writes to cluster.env and applies on next start. Reload swaps the model in the running cluster without a full restart.</p>
+      </div>
+    </div>
+
+    <div>
+      <h2 class="sec">Activity</h2>
+      <div class="console" id="console" aria-live="polite"></div>
+      <div class="actions" style="margin-top:10px;">
+        <button id="btn-vllm-logs" aria-label="Show vLLM logs">Show vLLM logs</button>
+        <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = async (path, method = "GET", body = null) => {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opt.body = JSON.stringify(body);
+  const res = await fetch(path, opt);
+  return res.json();
+};
+const toast = (msg) => {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 3200);
+};
+
+const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }[status] || "");
+
+let configLoaded = false;
+
+const renderStatus = (s) => {
+  // nodes
+  $("head-name").textContent = "myspark";
+  $("head-ip").textContent = s.nodes.head.ip;
+  $("head-iface").textContent = s.nodes.head.iface || "cx7";
+  $("worker-ip").textContent = s.nodes.worker.ip;
+  $("worker-host").textContent = s.nodes.worker.host;
+
+  // map checks by label
+  const by = {};
+  s.checks.forEach((c) => (by[c.label] = c));
+
+  const link = by["ConnectX-7 link"] || {};
+  const fabric = by["Fabric reachability"] || {};
+  const linkEl = $("link");
+  linkEl.className = "link";
+  $("head-dot").className = "dot " + dotClass(link.status);
+  $("worker-dot").className = "dot " + dotClass(fabric.status);
+  if (link.status === "ok" && fabric.status === "ok") { linkEl.classList.add("live"); $("link-speed").textContent = "200 Gb/s active"; }
+  else if (link.status === "error" || fabric.status === "error") { linkEl.classList.add("down"); $("link-speed").textContent = "link down"; }
+  else { linkEl.classList.add("degraded"); $("link-speed").textContent = "degraded"; }
+
+  // verdict
+  const vd = $("verdict-dot"), vt = $("verdict-text");
+  vd.className = "big dot " + dotClass(s.overall);
+  if (s.action) vt.innerHTML = `<span class="spin"></span>${s.action[0].toUpperCase() + s.action.slice(1)} the cluster...`;
+  else if (s.overall === "ok" && s.running) vt.textContent = "Cluster healthy and serving.";
+  else if (s.overall === "ok") vt.textContent = "Configuration good. Cluster idle.";
+  else if (s.overall === "warn") vt.textContent = "Running with warnings. See checks below.";
+  else vt.textContent = "Problems found. Review checks or run Optimize.";
+
+  // buttons reflect action state
+  const busy = !!s.action;
+  $("btn-start").disabled = busy || s.running;
+  $("btn-stop").disabled = busy || !s.running;
+  $("btn-optimize").disabled = busy;
+
+  // check cards
+  const grid = $("checks");
+  grid.innerHTML = "";
+  s.checks.forEach((c) => {
+    const div = document.createElement("div");
+    div.className = "card " + c.status;
+    div.innerHTML = `<div class="label"><span class="dot ${dotClass(c.status)}"></span>${c.label}</div><div class="detail">${c.detail}</div>`;
+    grid.appendChild(div);
+  });
+
+  // config fields (only fill once so typing isn't clobbered)
+  if (!configLoaded && s.config) {
+    $("f-model").value = s.config.MODEL || "";
+    $("f-tp").value = s.config.TENSOR_PARALLEL || "";
+    $("f-util").value = s.config.GPU_MEM_UTIL || "";
+    $("f-len").value = s.config.MAX_MODEL_LEN || "";
+    configLoaded = true;
+  }
+};
+
+const pollStatus = async () => {
+  try { renderStatus(await api("/api/status")); }
+  catch (e) { $("verdict-text").textContent = "Panel cannot reach the backend."; }
+};
+
+const renderActivity = (lines) => {
+  const c = $("console");
+  const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
+  c.innerHTML = lines.map((x) => {
+    let cls = "";
+    if (x.line.includes("[error]") || x.line.toLowerCase().includes("fail")) cls = "l-error";
+    else if (x.line.includes("[optimize]")) cls = "l-optimize";
+    else if (x.line.includes("[model]") || x.line.includes("[config]")) cls = "l-model";
+    return `<div class="${cls}"><span class="t">${x.t}</span>${x.line.replace(/</g, "&lt;")}</div>`;
+  }).join("");
+  if (atBottom) c.scrollTop = c.scrollHeight;
+};
+
+const pollActivity = async () => {
+  try { renderActivity((await api("/api/activity")).lines); } catch (e) {}
+};
+
+// actions
+$("btn-start").onclick = async () => { toast((await api("/api/start", "POST")).detail); pollStatus(); };
+$("btn-stop").onclick = async () => { toast((await api("/api/stop", "POST")).detail); pollStatus(); };
+$("btn-optimize").onclick = async () => {
+  $("btn-optimize").disabled = true;
+  toast("Running checks and fixes...");
+  const r = await api("/api/optimize", "POST");
+  const fixed = r.results.filter((x) => x.status === "fixed").length;
+  toast(`Optimize done. ${fixed} item(s) fixed.`);
+  pollActivity(); pollStatus();
+};
+$("btn-rdma").onclick = async () => {
+  toast("Checking NCCL transport...");
+  toast((await api("/api/rdma-check", "POST")).detail);
+  pollActivity();
+};
+$("btn-save").onclick = async () => {
+  const body = {
+    MODEL: $("f-model").value.trim(),
+    TENSOR_PARALLEL: $("f-tp").value,
+    GPU_MEM_UTIL: $("f-util").value,
+    MAX_MODEL_LEN: $("f-len").value,
+  };
+  toast((await api("/api/config", "POST", body)).detail);
+};
+$("btn-reload").onclick = async () => {
+  const model = $("f-model").value.trim();
+  if (!model) return toast("Enter a model first.");
+  toast((await api("/api/model", "POST", { model })).detail);
+  pollActivity();
+};
+$("btn-vllm-logs").onclick = async () => {
+  const r = await api("/api/logs");
+  const c = $("console");
+  c.innerHTML = `<div class="t">vLLM log tail</div>` + r.log.replace(/</g, "&lt;").split("\n").map((l) => `<div>${l}</div>`).join("");
+  c.scrollTop = c.scrollHeight;
+};
+$("btn-clear").onclick = () => { $("console").innerHTML = ""; };
+
+const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
+
+tick(); pollStatus(); pollActivity();
+setInterval(tick, 1000);
+setInterval(pollStatus, 4000);
+setInterval(pollActivity, 3000);
+</script>
+</body>
+</html>
