@@ -137,6 +137,27 @@
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
   .hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
+
+  /* live telemetry strip */
+  .telemetry { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .metric .mlabel { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
+  .metric .mval { font-family: var(--mono); font-size: 30px; font-weight: 600; color: var(--fabric); line-height: 1.1; margin-top: 4px; }
+  .metric .munit { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .nodestats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 26px; }
+  @media (max-width: 760px) { .nodestats { grid-template-columns: 1fr; } }
+  .nstat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .nstat-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+  .nstat-head span:first-child { font-family: var(--mono); font-weight: 600; font-size: 14px; }
+  .nstat-role { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim); }
+  .gauge { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .gauge-label { font-size: 11px; color: var(--muted); width: 52px; flex: none; font-family: var(--mono); }
+  .gbar { flex: 1; height: 8px; background: var(--bg); border-radius: 5px; overflow: hidden; border: 1px solid var(--line); }
+  .gfill { height: 100%; width: 0%; background: var(--fabric); border-radius: 5px; transition: width .6s ease; }
+  .gfill.mem { background: var(--accent); }
+  .gfill.hot { background: var(--warn); }
+  .gfill.crit { background: var(--err); }
+  .gpct { font-family: var(--mono); font-size: 12px; color: var(--muted); width: 64px; text-align: right; flex: none; }
 </style>
 </head>
 <body>
@@ -176,6 +197,26 @@
       <button class="primary" id="btn-start" aria-label="Start cluster">Start cluster</button>
       <button class="danger" id="btn-stop" aria-label="Stop cluster">Stop</button>
       <button id="btn-optimize" aria-label="Optimize and fix configuration">Optimize &amp; fix</button>
+    </div>
+  </div>
+
+  <h2 class="sec">Live telemetry</h2>
+  <div class="telemetry" id="telemetry">
+    <div class="metric"><div class="mlabel">Throughput</div><div class="mval" id="m-tps">--</div><div class="munit">tokens/sec</div></div>
+    <div class="metric"><div class="mlabel">In flight</div><div class="mval" id="m-running">--</div><div class="munit">requests</div></div>
+    <div class="metric"><div class="mlabel">Queued</div><div class="mval" id="m-waiting">--</div><div class="munit">waiting</div></div>
+    <div class="metric"><div class="mlabel">Generated</div><div class="mval" id="m-total">--</div><div class="munit">tokens total</div></div>
+  </div>
+  <div class="nodestats" id="nodestats">
+    <div class="nstat">
+      <div class="nstat-head"><span id="ns-head-name">myspark</span><span class="nstat-role">head</span></div>
+      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-head-gpu"></div></div><div class="gpct" id="ns-head-gpu-pct">--</div></div>
+      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-head-mem"></div></div><div class="gpct" id="ns-head-mem-pct">--</div></div>
+    </div>
+    <div class="nstat">
+      <div class="nstat-head"><span id="ns-worker-name">myspark2</span><span class="nstat-role">worker</span></div>
+      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-worker-gpu"></div></div><div class="gpct" id="ns-worker-gpu-pct">--</div></div>
+      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-worker-mem"></div></div><div class="gpct" id="ns-worker-mem-pct">--</div></div>
     </div>
   </div>
 
@@ -367,10 +408,61 @@ $("btn-clear").onclick = () => { $("console").innerHTML = ""; };
 
 const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
 
-tick(); pollStatus(); pollActivity();
+// live metrics: compute tokens/sec from the delta in cumulative generated tokens
+let lastGen = null, lastGenTime = null;
+
+const fmtNum = (n) => {
+  if (n == null) return "--";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return Math.round(n).toString();
+};
+
+const setGauge = (fillId, pctId, value, isMem, total) => {
+  const fill = $(fillId), pct = $(pctId);
+  if (value == null) { fill.style.width = "0%"; pct.textContent = "--"; return; }
+  let widthPct, label;
+  if (isMem) {
+    widthPct = total ? Math.round((value / total) * 100) : 0;
+    label = `${(value / 1024).toFixed(0)}/${(total / 1024).toFixed(0)}G`;
+  } else {
+    widthPct = value;
+    label = value + "%";
+  }
+  fill.style.width = Math.min(widthPct, 100) + "%";
+  fill.className = "gfill" + (isMem ? " mem" : "") + (widthPct >= 92 ? " crit" : widthPct >= 80 ? " hot" : "");
+  pct.textContent = label;
+};
+
+const pollMetrics = async () => {
+  let m;
+  try { m = await api("/api/metrics"); } catch (e) { return; }
+  const s = m.serving || {};
+  // tokens/sec from cumulative counter delta
+  const now = Date.now();
+  if (s.gen_tokens_total != null && lastGen != null && lastGenTime != null) {
+    const dt = (now - lastGenTime) / 1000;
+    const dtok = s.gen_tokens_total - lastGen;
+    const tps = dt > 0 ? Math.max(0, dtok / dt) : 0;
+    $("m-tps").textContent = tps >= 1 ? tps.toFixed(1) : (dtok > 0 ? "<1" : "0");
+  }
+  if (s.gen_tokens_total != null) { lastGen = s.gen_tokens_total; lastGenTime = now; }
+  $("m-running").textContent = s.requests_running != null ? Math.round(s.requests_running) : "--";
+  $("m-waiting").textContent = s.requests_waiting != null ? Math.round(s.requests_waiting) : "--";
+  $("m-total").textContent = fmtNum(s.gen_tokens_total);
+
+  const h = m.nodes?.head || {}, w = m.nodes?.worker || {};
+  setGauge("ns-head-gpu", "ns-head-gpu-pct", h.gpu_util, false);
+  setGauge("ns-head-mem", "ns-head-mem-pct", h.mem_used, true, h.mem_total);
+  setGauge("ns-worker-gpu", "ns-worker-gpu-pct", w.gpu_util, false);
+  setGauge("ns-worker-mem", "ns-worker-mem-pct", w.mem_used, true, w.mem_total);
+};
+
+tick(); pollStatus(); pollActivity(); pollMetrics();
 setInterval(tick, 1000);
 setInterval(pollStatus, 4000);
 setInterval(pollActivity, 3000);
+setInterval(pollMetrics, 3000);
 </script>
 </body>
 </html>

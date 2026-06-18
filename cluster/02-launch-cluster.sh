@@ -55,16 +55,28 @@ log "Head iface: ${CX7_IFACE} (${HEAD_IP})  |  Worker iface: ${WORKER_IFACE} (${
 # ------------------------------------------------------------
 # UMA hygiene: drop page cache on both nodes so CUDA can claim memory
 # ------------------------------------------------------------
+# Free unified memory before load. This is hygiene, not correctness, so a
+# missing sudo password must not abort the launch. Try passwordless; warn if unavailable.
 log "Dropping page caches on both nodes (GB10 unified memory)"
-sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
-${SSH_WORKER} "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
+if sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+    echo "Head caches dropped."
+else
+    echo "Skipped head cache drop (no passwordless sudo). Not required; continuing."
+fi
+if ${SSH_WORKER} "sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'" 2>/dev/null; then
+    echo "Worker caches dropped."
+else
+    echo "Skipped worker cache drop (no passwordless sudo). Not required; continuing."
+fi
 
 # ------------------------------------------------------------
 # Pull image on both nodes
 # ------------------------------------------------------------
-log "Pulling ${VLLM_IMAGE} on both nodes (skips if present)"
-docker pull "${VLLM_IMAGE}"
-${SSH_WORKER} "docker pull ${VLLM_IMAGE}"
+# Locally-built images (e.g. gx10/vllm-ray) have no registry to pull from.
+# Only pull if the image is genuinely absent, and never abort on it.
+log "Ensuring ${VLLM_IMAGE} is present on both nodes"
+docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 || docker pull "${VLLM_IMAGE}" || true
+${SSH_WORKER} "docker image inspect ${VLLM_IMAGE} >/dev/null 2>&1 || docker pull ${VLLM_IMAGE}" || true
 
 # ------------------------------------------------------------
 # Clean any stale containers

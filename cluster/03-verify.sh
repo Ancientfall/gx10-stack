@@ -19,7 +19,7 @@ info() { echo -e "\033[1;36m[INFO]\033[0m $*"; }
 SSH_WORKER="ssh ${CLUSTER_USER}@${WORKER_SSH_HOST}"
 
 echo "=== 1. ConnectX-7 link state ==="
-LINK="$(ibdev2netdev 2>/dev/null | grep -c Up || true)"
+LINK="$(ibdev2netdev 2>/dev/null | grep -c '(Up)' || true)"
 [[ "${LINK}" -ge 1 ]] && ok "CX7 link Up on head (${CX7_IFACE})" || bad "No CX7 link Up on head"
 
 MTU="$(cat /sys/class/net/${CX7_IFACE}/mtu 2>/dev/null || echo 0)"
@@ -38,9 +38,9 @@ fi
 if [[ "${1:-}" == "--bw" ]]; then
     echo
     echo "=== 2b. RDMA bandwidth (ib_write_bw, ~10s) ==="
-    ${SSH_WORKER} "nohup ib_write_bw -d \$(ibdev2netdev | awk '/Up/{print \$1; exit}') >/dev/null 2>&1 &" || true
+    ${SSH_WORKER} "nohup ib_write_bw -d \$(ibdev2netdev | awk '/(Up)/{print \$1; exit}') >/dev/null 2>&1 &" || true
     sleep 2
-    ib_write_bw -d "$(ibdev2netdev | awk '/Up/{print $1; exit}')" "${WORKER_IP}" || bad "ib_write_bw failed"
+    ib_write_bw -d "$(ibdev2netdev | awk '/\(Up\)/{print $1; exit}')" "${WORKER_IP}" || bad "ib_write_bw failed"
     info "Expect roughly 180+ Gb/s average on a healthy 200G DAC link"
 fi
 

@@ -112,7 +112,9 @@ fi
 
 # Pick the first CX7 port reporting link Up. Cable must be plugged into the
 # SAME port number on both boxes before running this.
-CX7_IFACE="$(ibdev2netdev 2>/dev/null | awk '/Up/ {print $5; exit}')"
+# Match the parenthesized "(Up)" and take the field right before it. This is
+# robust to spacing and the "==>" arrow, unlike a fixed column index.
+CX7_IFACE="$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print $(NF-1); exit}')"
 
 if [[ -z "${CX7_IFACE}" ]]; then
     echo

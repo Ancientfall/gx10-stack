@@ -280,6 +280,73 @@ def check_api(c) -> dict:
         return {"status": "warn", "label": "vLLM API", "detail": "API up but no model loaded yet."}
 
 
+def _parse_prom(text: str, name: str):
+    """Sum all samples of a Prometheus metric family, ignoring labels."""
+    total = 0.0
+    found = False
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if line.split("{")[0].split(" ")[0] == name:
+            try:
+                total += float(line.rsplit(" ", 1)[1])
+                found = True
+            except (ValueError, IndexError):
+                pass
+    return total if found else None
+
+
+def gather_metrics() -> dict:
+    """Live serving throughput from vLLM /metrics plus per-node memory/util."""
+    c = cfg()
+    out = {"serving": {}, "nodes": {}}
+
+    # vLLM exposes Prometheus metrics on the same port as the API
+    rc, body, _ = run(["curl", "-s", "--max-time", "4",
+                       f"http://localhost:{c['API_PORT']}/metrics"], timeout=6)
+    if rc == 0 and body:
+        gen = _parse_prom(body, "vllm:generation_tokens_total")
+        prompt = _parse_prom(body, "vllm:prompt_tokens_total")
+        running = _parse_prom(body, "vllm:num_requests_running")
+        waiting = _parse_prom(body, "vllm:num_requests_waiting")
+        out["serving"] = {
+            "gen_tokens_total": gen,
+            "prompt_tokens_total": prompt,
+            "requests_running": running,
+            "requests_waiting": waiting,
+        }
+
+    # Per-node: GPU utilization (nvidia-smi) and unified memory (free).
+    # On GB10 UMA, host memory IS the GPU memory, so we report free -m.
+    def node_stats(local: bool):
+        if local:
+            rc1, util, _ = run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                                "--format=csv,noheader,nounits"], timeout=6)
+            rc2, mem, _ = run(["sh", "-c",
+                "free -m | awk '/^Mem:/{print $2,$3,$7}'"], timeout=6)
+        else:
+            rc1, util, _ = ssh_worker(
+                "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits", timeout=8)
+            rc2, mem, _ = ssh_worker("free -m | awk '/^Mem:/{print $2,$3,$7}'", timeout=8)
+        stats = {"gpu_util": None, "mem_total": None, "mem_used": None, "mem_avail": None}
+        if rc1 == 0 and util.strip():
+            try:
+                stats["gpu_util"] = int(util.strip().splitlines()[0])
+            except (ValueError, IndexError):
+                pass
+        if rc2 == 0 and mem.strip():
+            try:
+                total, used, avail = mem.strip().split()
+                stats.update(mem_total=int(total), mem_used=int(used), mem_avail=int(avail))
+            except ValueError:
+                pass
+        return stats
+
+    out["nodes"]["head"] = node_stats(local=True)
+    out["nodes"]["worker"] = node_stats(local=False)
+    return out
+
+
 def gather_status() -> dict:
     c = cfg()
     checks = [
@@ -477,6 +544,11 @@ def index():
 @app.get("/api/status")
 def api_status():
     return JSONResponse(gather_status())
+
+
+@app.get("/api/metrics")
+def api_metrics():
+    return JSONResponse(gather_metrics())
 
 
 @app.get("/api/activity")

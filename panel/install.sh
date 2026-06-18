@@ -67,9 +67,11 @@ rm -f "${SUDO_FILE}"
 # ------------------------------------------------------------
 log "Installing systemd service"
 UNIT="/tmp/gx10-panel.service"
+PANEL_PORT="${GX10_PANEL_PORT:-8080}"
 sed -e "s#__USER__#${PANEL_USER}#g" \
     -e "s#__DIR__#${DIR}#g" \
     -e "s#__KIT_DIR__#${KIT_DIR}#g" \
+    -e "s#__PANEL_PORT__#${PANEL_PORT}#g" \
     "${DIR}/gx10-panel.service" > "${UNIT}"
 sudo cp "${UNIT}" /etc/systemd/system/gx10-panel.service
 rm -f "${UNIT}"
@@ -84,12 +86,12 @@ sudo systemctl --no-pager --lines=0 status gx10-panel.service || true
 log "Done"
 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
 echo "Kit dir:  ${KIT_DIR}"
-echo "Local:    http://localhost:8080"
+echo "Local:    http://localhost:${PANEL_PORT}"
 if [[ -n "${TS_IP}" ]]; then
-    echo "Tailscale: http://${TS_IP}:8080  (reachable from your Mac/phone)"
+    echo "Tailscale: http://${TS_IP}:${PANEL_PORT}  (reachable from your Mac/phone)"
     echo
     echo "Optional, for a clean HTTPS URL over Tailscale:"
-    echo "    sudo tailscale serve --bg 8080"
+    echo "    sudo tailscale serve --bg ${PANEL_PORT}"
 fi
 echo
 echo "Manage:   sudo systemctl restart gx10-panel   |   journalctl -u gx10-panel -f"
