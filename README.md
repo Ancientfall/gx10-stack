@@ -7,11 +7,17 @@ Setup scripts and a web control panel for a dual ASUS Ascent GX10 (NVIDIA GB10) 
 ```
 gx10-stack/
   cluster/    one-time node setup, cluster launch, and verify scripts
-  panel/      FastAPI web control panel (start, stop, optimize, monitor)
+  panel/      FastAPI web control panel (status, telemetry, models, history)
 ```
 
 Each folder has its own README with details. Start with `cluster/` to bring the
 two nodes up, then `panel/` for the web UI.
+
+The panel is a single page that covers the whole workflow: a live fabric/health
+view, start/stop/optimize, real-time per-node telemetry, model management
+(curated favorites, Hugging Face search, local library, and a prompt tester with
+download/load progress and rollback), serving-parameter editing, history & cost
+charts, and an optional vLLM image/version manager. See `panel/README.md`.
 
 ## Quickstart
 
