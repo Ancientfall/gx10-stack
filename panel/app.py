@@ -741,48 +741,78 @@ def _explain_error(log: str) -> str:
     return "Engine failed to start. See vLLM logs for details."
 
 
+def _model_matches(served: str, requested: str) -> bool:
+    """True if vLLM's served id is the model we asked for (tolerating path vs repo-id)."""
+    if not served or not requested:
+        return False
+    s, r = served.strip().lower(), requested.strip().lower()
+    return s == r or s.rsplit("/", 1)[-1] == r.rsplit("/", 1)[-1]
+
+
+def _vllm_dead() -> bool:
+    """True only when we're sure no vllm serve process is running.
+
+    pgrep exit codes: 0 = a process matched, 1 = none matched, anything else
+    (2/3 usage, 126/127 missing) = unknown. Only rc==1 is a confident "dead";
+    on unknown we assume alive so a missing pgrep can't cause a false failure.
+    """
+    rc, _, _ = run(["docker", "exec", CONTAINER, "pgrep", "-f", "vllm serve"], timeout=8)
+    return rc == 1
+
+
 def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -> bool:
-    """Poll until the model serves (return True) or fails (return False)."""
+    """Poll until the model serves (True) or the engine dies / times out (False).
+
+    Success is the API serving the requested model. Failure is declared only
+    when the vllm serve process has actually exited - non-fatal tracebacks in
+    the log (kernel fallbacks, quantization warnings) are common during load,
+    especially for newer formats like NVFP4, and must not be mistaken for a
+    crash or a model that loads fine gets reported as failed.
+    """
     c = cfg()
     port = c["API_PORT"]
     start = time.time()
     phase = "loading"
     while time.time() - start < timeout_s:
+        # 1) success: API is serving our model
         rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{port}/v1/models"], timeout=5)
         if rc == 0 and out:
             try:
                 served = json.loads(out)["data"][0]["id"]
-                if served == model:
+                if _model_matches(served, model):
                     _set_dl(active=False, status="ready", percent=100,
                             detail=f"{model} is live and serving.", error=None)
                     log_line(f"[model] {model} is ready and serving")
                     return True
             except Exception:
                 pass
-        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "40", "/var/log/vllm.log"], timeout=8)
-        if rc2 == 0 and log:
-            low = log.lower()
-            # auto-correct context length once
-            mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
-            if mlen and not _retried:
-                real_max = int(mlen.group(1))
-                log_line(f"[model] {model} caps context at {real_max}; retrying")
-                _set_dl(active=True, status="loading",
-                        detail=f"{model} max context is {real_max}, retrying...")
-                _start_vllm(model, max_len_override=real_max)
-                _model_maxlen_cache[model] = real_max
-                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
-            # fatal error?
-            if ("engine core initialization failed" in low or "traceback (most recent call last)" in low
-                    or "raise runtimeerror" in low):
-                reason = _explain_error(log)
-                _set_dl(active=False, status="error", error=reason, detail=reason)
-                log_line(f"[model] load FAILED: {reason}")
-                return False
-            if "capturing" in low or "graph" in low or "compile" in low:
-                phase = "compiling"
-            elif "loading safetensors" in low or "loading weights" in low:
-                phase = "loading weights"
+
+        # 2) read the recent log for phase hints + a one-time context-length fix
+        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "60", "/var/log/vllm.log"], timeout=8)
+        log = log if (rc2 == 0 and log) else ""
+        low = log.lower()
+        mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
+        if mlen and not _retried:
+            real_max = int(mlen.group(1))
+            log_line(f"[model] {model} caps context at {real_max}; retrying")
+            _set_dl(active=True, status="loading",
+                    detail=f"{model} max context is {real_max}, retrying...")
+            _start_vllm(model, max_len_override=real_max)
+            _model_maxlen_cache[model] = real_max
+            return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
+
+        # 3) failure: only when the engine process has actually exited. Grace the
+        #    first 25s so the pkill->relaunch gap and slow startup don't trip it.
+        if (time.time() - start) > 25 and _vllm_dead():
+            reason = _explain_error(log) if log else "Engine exited during startup. See vLLM logs."
+            _set_dl(active=False, status="error", error=reason, detail=reason)
+            log_line(f"[model] load FAILED: {reason}")
+            return False
+
+        if "capturing" in low or "graph" in low or "compile" in low:
+            phase = "compiling"
+        elif "loading safetensors" in low or "loading weights" in low:
+            phase = "loading weights"
         elapsed = int(time.time() - start)
         _set_dl(active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
         time.sleep(5)
@@ -920,28 +950,69 @@ def swap_model(model: str):
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
 
 
-def set_serving_mode(mode: str) -> dict:
-    """Switch between single-node (TP=1, mp backend) and two-node (TP=2, ray).
+def _ray_gpu_count() -> int:
+    """How many GPUs are currently registered with the running Ray cluster."""
+    py = ("import ray;ray.init(address='auto',logging_level='ERROR');"
+          "print(int(ray.cluster_resources().get('GPU',0)))")
+    rc, out, _ = run(["docker", "exec", CONTAINER, "python3", "-c", py], timeout=15)
+    if rc != 0:
+        return 0
+    try:
+        return int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 0
 
-    Persists TENSOR_PARALLEL, then — if a model is currently serving — reloads
-    it under the new mode (with the usual rollback on failure). If nothing is
-    serving, the change just applies on the next load/start.
+
+def _stop_worker_container() -> bool:
+    """Best-effort: remove the vLLM/Ray container on the worker so its GPU idles."""
+    c = cfg()
+    target = f'{c["CLUSTER_USER"]}@{c["WORKER_SSH_HOST"]}'
+    rc, _, _ = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    target, f"docker rm -f {CONTAINER}"], timeout=20)
+    return rc == 0
+
+
+def _apply_mode_reload(model: str, mode: str):
+    """Reload the live model under the new mode; if single, idle the worker after."""
+    _load_worker(model)
+    if mode == "single" and currently_serving() == model and _stop_worker_container():
+        log_line("[mode] worker container stopped - second node idle")
+
+
+def set_serving_mode(mode: str) -> dict:
+    """Switch between single-node (TP=1, mp, worker idle) and two-node (TP=2, ray).
+
+    Persists TENSOR_PARALLEL. If a model is serving, reloads it under the new
+    mode (rollback on failure). Single-node also stops the worker container so
+    the second GX10 idles; switching back to two-node needs a Stop/Start to
+    rebuild the Ray cluster, so we say so rather than attempt a doomed reload.
     """
     tp = 1 if mode == "single" else 2
     label = "single node" if mode == "single" else "both nodes (TP=2)"
     write_env_value(CLUSTER_ENV, "TENSOR_PARALLEL", str(tp))
     log_line(f"[mode] serving mode -> {label}")
     serving = currently_serving()
+
+    # Going back to two-node needs the worker rejoined to Ray; a hot reload
+    # can't do that, so ask for a relaunch when the worker is idle.
+    if mode == "cluster" and serving and _ray_gpu_count() < 2:
+        return {"ok": True, "tp": tp, "reloaded": False,
+                "detail": "Set to both nodes. The worker is idle - Stop then Start to bring it back and shard across both."}
+
     if not serving:
+        if mode == "single" and _stop_worker_container():
+            log_line("[mode] worker container stopped - second node idle")
         return {"ok": True, "tp": tp, "reloaded": False,
                 "detail": f"Set to {label}. Applies when you next load or start a model."}
+
     with _download_lock:
         if _download["active"]:
             return {"ok": False, "tp": tp,
                     "detail": f"Busy: {_download['model']} ({_download['status']}). Try again when it finishes."}
-    threading.Thread(target=_load_worker, args=(serving,), daemon=True).start()
+    threading.Thread(target=_apply_mode_reload, args=(serving, mode), daemon=True).start()
+    extra = " and idling the worker" if mode == "single" else ""
     return {"ok": True, "tp": tp, "reloaded": True,
-            "detail": f"Switching to {label} and reloading {serving}…"}
+            "detail": f"Switching to {label}{extra} and reloading {serving}…"}
 
 
 def preload_check(model: str) -> dict:

@@ -23,6 +23,22 @@ Turns two ASUS Ascent GX10s (NVIDIA GB10, 128GB each) into a single 256GB tensor
 8. From head: `./02-launch-cluster.sh`
 9. From head: `./03-verify.sh` (add `--bw` for an RDMA bandwidth test)
 
+## Single-node mode
+
+Models that fit on one GB10 run faster per token on a single box (no cross-node
+NCCL), and you can leave the second unit idle. The launch script supports this:
+
+```bash
+./02-launch-cluster.sh single     # head GPU only (TP=1, mp backend), worker left idle
+./02-launch-cluster.sh cluster    # both boxes (TP=2, Ray) - the default
+./02-launch-cluster.sh            # picks single when TENSOR_PARALLEL=1, else two-node
+```
+
+Single mode never starts the worker container (and clears any stale one), so the
+second GX10 sits idle. `03-verify.sh` will flag the fabric / 2-GPU checks as down
+in this mode - that is expected. The web panel exposes the same choice as a
+**Single node / Both nodes** toggle and recommends one from the model's size.
+
 ## Hardware reality check
 
 Each QSFP port is 200Gbps. A single direct cable between the boxes is a 200G link, not 400G. That is still plenty: tensor-parallel traffic for 70B to 120B class models saturates well below that. If you ever want both ports bonded, that requires a switch path and is not part of NVIDIA's two-node playbook.
