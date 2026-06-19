@@ -39,6 +39,14 @@ second GX10 sits idle. `03-verify.sh` will flag the fabric / 2-GPU checks as dow
 in this mode - that is expected. The web panel exposes the same choice as a
 **Single node / Both nodes** toggle and recommends one from the model's size.
 
+## Alternative engine: spark-vllm-docker
+
+For the broadest model and quantization coverage on GB10 (latest vLLM +
+FlashInfer, NVFP4 FP4-MoE, AWQ/GPTQ, recipes and per-model mods), you can run
+[`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker) as the
+orchestrator and still drive it from the GX10 panel. See
+[`SPARK-VLLM.md`](SPARK-VLLM.md). The native kit here remains the fallback.
+
 ## Hardware reality check
 
 Each QSFP port is 200Gbps. A single direct cable between the boxes is a 200G link, not 400G. That is still plenty: tensor-parallel traffic for 70B to 120B class models saturates well below that. If you ever want both ports bonded, that requires a switch path and is not part of NVIDIA's two-node playbook.

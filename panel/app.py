@@ -55,8 +55,17 @@ def _resolve_kit_dir() -> Path:
 KIT_DIR = _resolve_kit_dir()
 CLUSTER_ENV = KIT_DIR / "cluster.env"
 NODE_CONF = Path("/etc/gx10-cluster.conf")
-CONTAINER = "vllm-node"
+# Container the panel exec's into for serve/logs/metrics. Our native kit names it
+# "vllm-node"; eugr/spark-vllm-docker names it "vllm_node". Override accordingly.
+CONTAINER = os.environ.get("GX10_CONTAINER", "vllm-node")
 LAUNCH_SCRIPT = KIT_DIR / "02-launch-cluster.sh"
+
+# Optional external orchestrator (e.g. eugr/spark-vllm-docker). When GX10_START_CMD
+# / GX10_STOP_CMD are set, Start/Stop run those shell commands in GX10_ORCH_DIR
+# instead of the native launch script. Unset = native behaviour (unchanged).
+ORCH_DIR = Path(os.environ.get("GX10_ORCH_DIR", str(KIT_DIR)))
+START_CMD = os.environ.get("GX10_START_CMD")
+STOP_CMD = os.environ.get("GX10_STOP_CMD")
 
 PANEL_HOST = os.environ.get("GX10_PANEL_HOST", "0.0.0.0")
 PANEL_PORT = int(os.environ.get("GX10_PANEL_PORT", "8080"))
@@ -641,13 +650,19 @@ def _run_launch(arg=None):
     with _action_lock:
         _current_action["name"] = name
         try:
-            if not LAUNCH_SCRIPT.exists():
-                log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
-                         f"Set GX10_KIT_DIR.")
-                return
-            cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
+            custom = STOP_CMD if arg == "stop" else START_CMD
+            if custom:
+                cmd = ["bash", "-lc", custom]
+                cwd = str(ORCH_DIR)
+            else:
+                if not LAUNCH_SCRIPT.exists():
+                    log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
+                             f"Set GX10_KIT_DIR (or GX10_START_CMD for an external orchestrator).")
+                    return
+                cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
+                cwd = str(KIT_DIR)
             log_line(f"[{name}] {' '.join(cmd)}")
-            proc = subprocess.Popen(cmd, cwd=str(KIT_DIR), text=True,
+            proc = subprocess.Popen(cmd, cwd=cwd, text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             for line in proc.stdout:
                 if line.strip():
@@ -834,7 +849,10 @@ def _download_worker(model: str, auto_load: bool):
     log_line(f"[download] starting {model}")
 
     env_prefix = f"HF_TOKEN={token} " if token else ""
-    cmd = f"{env_prefix}hf download '{model}' 2>&1"
+    # `hf` is the current HuggingFace CLI; fall back to the legacy `huggingface-cli`
+    # for images (like eugr/spark-vllm-docker) that only ship the older entrypoint.
+    dl = f"command -v hf >/dev/null 2>&1 && hf download '{model}' || huggingface-cli download '{model}'"
+    cmd = f"{env_prefix}{dl} 2>&1"
 
     proc = subprocess.Popen(
         ["docker", "exec", CONTAINER, "bash", "-lc", cmd],

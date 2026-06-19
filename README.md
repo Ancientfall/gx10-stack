@@ -67,3 +67,6 @@ ssh nealasmothers@myspark2 'cd gx10-stack && git pull'
 - The panel expects the kit at `../cluster` (this repo layout) or `~/gx10-cluster`,
   or set `GX10_KIT_DIR`.
 - Keep the panel on Tailscale only. It has no auth by design.
+- For the broadest model/quant coverage on GB10, you can run the
+  [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) engine and drive
+  it from the panel via a few `GX10_*` env vars — see `cluster/SPARK-VLLM.md`.
