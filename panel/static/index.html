@@ -166,7 +166,49 @@
   .mtab:hover { color: var(--text); border-color: transparent; }
   .mtab.active { color: var(--fabric); border-bottom-color: var(--fabric); }
   .mpane { margin-bottom: 26px; }
-  .mlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+  .mlist { display: block; }
+  .mlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 16px; }
+  .pager button { padding: 7px 16px; font-size: 13px; }
+  .pg-info { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+  /* history + cost */
+  .histbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+  .histwin { display: flex; gap: 6px; }
+  .hwin { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; font-size: 12.5px; color: var(--muted); }
+  .hwin.active { color: var(--fabric); border-color: var(--fabric-dim); }
+  .costcards { display: flex; gap: 10px; flex-wrap: wrap; }
+  .costcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; }
+  .costcard .cc-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); }
+  .costcard .cc-val { font-family: var(--mono); font-size: 17px; font-weight: 600; color: var(--up); }
+  .costcard .cc-sub { font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 26px; }
+  @media (max-width: 760px) { .charts { grid-template-columns: 1fr; } }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .chart-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .chart svg { width: 100%; height: 140px; display: block; }
+  .chart .ln-head { fill: none; stroke: var(--fabric); stroke-width: 2; }
+  .chart .ln-worker { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 4 3; }
+  .chart .ln-single { fill: none; stroke: var(--fabric); stroke-width: 2; }
+  .chart .ar-head { fill: var(--fabric); opacity: 0.08; }
+  .chart .ax { stroke: var(--line); stroke-width: 1; }
+  .chart .axlabel { fill: var(--dim); font-size: 10px; font-family: var(--mono); }
+
+  /* download progress banner */
+  .dlbanner { background: var(--panel); border: 1px solid var(--fabric-dim); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+  .dl-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .dl-head span:first-child { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+  .dl-head span:last-child { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fabric); }
+  .dl-track { height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .dl-fill { height: 100%; width: 0%; background: var(--fabric); border-radius: 6px; transition: width .5s ease; }
+  .dl-fill.error { background: var(--err); }
+  .dl-meta { display: flex; justify-content: space-between; margin-top: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+
+  /* expanded node telemetry readouts */
+  .nstat-extra { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .ne { text-align: center; }
+  .ne .ne-val { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--text); }
+  .ne .ne-lbl { font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 2px; }
   .mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 15px; display: flex; flex-direction: column; gap: 8px; }
   .mcard.active { border-color: var(--up); box-shadow: inset 0 0 0 1px var(--up); }
   .mcard .mid { font-family: var(--mono); font-size: 13px; font-weight: 600; word-break: break-all; }
@@ -242,11 +284,21 @@
       <div class="nstat-head"><span id="ns-head-name">myspark</span><span class="nstat-role">head</span></div>
       <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-head-gpu"></div></div><div class="gpct" id="ns-head-gpu-pct">--</div></div>
       <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-head-mem"></div></div><div class="gpct" id="ns-head-mem-pct">--</div></div>
+      <div class="nstat-extra">
+        <div class="ne"><div class="ne-val" id="ns-head-power">--</div><div class="ne-lbl">Power W</div></div>
+        <div class="ne"><div class="ne-val" id="ns-head-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+        <div class="ne"><div class="ne-val" id="ns-head-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+      </div>
     </div>
     <div class="nstat">
       <div class="nstat-head"><span id="ns-worker-name">myspark2</span><span class="nstat-role">worker</span></div>
       <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-worker-gpu"></div></div><div class="gpct" id="ns-worker-gpu-pct">--</div></div>
       <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-worker-mem"></div></div><div class="gpct" id="ns-worker-mem-pct">--</div></div>
+      <div class="nstat-extra">
+        <div class="ne"><div class="ne-val" id="ns-worker-power">--</div><div class="ne-lbl">Power W</div></div>
+        <div class="ne"><div class="ne-val" id="ns-worker-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+        <div class="ne"><div class="ne-val" id="ns-worker-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+      </div>
     </div>
   </div>
 
@@ -294,7 +346,28 @@
     </div>
   </div>
 
+  <h2 class="sec">History &amp; cost</h2>
+  <div class="histbar">
+    <div class="histwin" role="tablist">
+      <button class="hwin active" data-win="hour">Hour</button>
+      <button class="hwin" data-win="day">Day</button>
+      <button class="hwin" data-win="week">Week</button>
+    </div>
+    <div class="costcards" id="cost-cards"></div>
+  </div>
+  <div class="charts">
+    <div class="chart"><div class="chart-title">Throughput (tokens/sec)</div><svg id="chart-tps" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Temperature (&deg;C)</div><svg id="chart-temp" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Power draw (W)</div><svg id="chart-power" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Memory used (GB)</div><svg id="chart-mem" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+  </div>
+
   <h2 class="sec">Models</h2>
+  <div class="dlbanner hidden" id="dl-banner">
+    <div class="dl-head"><span id="dl-model">model</span><span id="dl-status">downloading</span></div>
+    <div class="dl-track"><div class="dl-fill" id="dl-fill"></div></div>
+    <div class="dl-meta"><span id="dl-pct">0%</span><span id="dl-speed"></span></div>
+  </div>
   <div class="modeltabs" role="tablist">
     <button class="mtab active" id="tab-curated" role="tab">Favorites</button>
     <button class="mtab" id="tab-search" role="tab">Discover</button>
@@ -513,24 +586,52 @@ const wireLoadButtons = (container) => {
   });
 };
 
+// Generic paginator: renders a slice of `items` into `listId`, with controls.
+// State is stored per-list so each tab pages independently.
+const PAGE_SIZE = 9;
+const pageState = {};
+
+const renderPaged = (listId, items, cardFn, emptyMsg, opts = {}) => {
+  const list = $(listId);
+  if (!items.length) { list.innerHTML = `<p class="hint">${emptyMsg}</p>`; return; }
+  if (pageState[listId] == null) pageState[listId] = 0;
+  const pages = Math.ceil(items.length / PAGE_SIZE);
+  if (pageState[listId] >= pages) pageState[listId] = pages - 1;
+  const page = pageState[listId];
+  const slice = items.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+  const cards = slice.map((m) => cardFn(m)).join("");
+  const controls = pages > 1 ? `
+    <div class="pager">
+      <button class="pg-prev" ${page === 0 ? "disabled" : ""} aria-label="Previous page">Previous</button>
+      <span class="pg-info">Page ${page + 1} of ${pages} · ${items.length} models</span>
+      <button class="pg-next" ${page >= pages - 1 ? "disabled" : ""} aria-label="Next page">Next</button>
+    </div>` : `<div class="pager"><span class="pg-info">${items.length} model${items.length === 1 ? "" : "s"}</span></div>`;
+
+  list.innerHTML = `<div class="mlist-grid">${cards}</div>${controls}`;
+  wireLoadButtons(list);
+  const prev = list.querySelector(".pg-prev"), next = list.querySelector(".pg-next");
+  if (prev) prev.onclick = () => { pageState[listId] = Math.max(0, page - 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
+  if (next) next.onclick = () => { pageState[listId] = Math.min(pages - 1, page + 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
+};
+
 const loadCurated = async () => {
   const r = await api("/api/models/curated");
   const b = r.budget;
   $("budget-line").textContent = `Pooled memory ~${b.pooled_gb}GB across both nodes, ~${b.usable_gb}GB usable. Single node holds ~${b.single_node_gb}GB. Estimates are approximate.`;
-  const list = $("curated-list");
-  list.innerHTML = r.models.map((m) => modelCard(m)).join("");
-  wireLoadButtons(list);
+  pageState["curated-list"] = 0;
+  renderPaged("curated-list", r.models, (m) => modelCard(m), "No favorites configured.");
 };
 
 const loadLibrary = async () => {
   const r = await api("/api/models/cached");
-  const list = $("library-list");
-  if (!r.models.length) { list.innerHTML = '<p class="hint">No models cached yet. Load one from Favorites or Discover.</p>'; return; }
   const current = ($("f-model").value || "").trim();
-  list.innerHTML = r.models.map((m) => modelCard(
-    { id: m.id, fit: "unknown", footprint_gb: null, cached: true, active: m.id === current, note: m.size_gb ? `${m.size_gb}GB on disk` : "" }
-  )).join("");
-  wireLoadButtons(list);
+  const items = r.models.map((m) => ({
+    id: m.id, fit: "unknown", footprint_gb: null, cached: true,
+    active: m.id === current, note: m.size_gb ? `${m.size_gb}GB on disk` : "",
+  }));
+  pageState["library-list"] = 0;
+  renderPaged("library-list", items, (m) => modelCard(m), "No models cached yet. Load one from Favorites or Discover.");
 };
 
 const runSearch = async () => {
@@ -538,10 +639,8 @@ const runSearch = async () => {
   if (!q) return;
   $("search-list").innerHTML = '<p class="hint">Searching Hugging Face...</p>';
   const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
-  const list = $("search-list");
-  if (!r.results.length) { list.innerHTML = '<p class="hint">No results. Try different terms.</p>'; return; }
-  list.innerHTML = r.results.map((m) => modelCard(m, { downloads: m.downloads })).join("");
-  wireLoadButtons(list);
+  pageState["search-list"] = 0;
+  renderPaged("search-list", r.results, (m) => modelCard(m, { downloads: m.downloads }), "No results. Try different terms.");
 };
 $("search-btn").onclick = runSearch;
 $("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
@@ -571,6 +670,74 @@ Object.keys(tabs).forEach((k) => {
 });
 
 loadCurated();
+
+// ---------- History & cost ----------
+let histWindow = "hour";
+
+const buildLine = (points, w, h, pad, vmin, vmax) => {
+  if (!points.length) return "";
+  const n = points.length;
+  const xspan = w - pad * 2, yspan = h - pad * 2;
+  const range = (vmax - vmin) || 1;
+  return points.map((v, i) => {
+    const x = pad + (n === 1 ? xspan / 2 : (i / (n - 1)) * xspan);
+    const y = pad + yspan - ((v - vmin) / range) * yspan;
+    return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+};
+
+const drawChart = (svgId, samples, headKey, workerKey, opts = {}) => {
+  const svg = $(svgId);
+  const W = 600, H = 140, P = 22;
+  const headVals = samples.map((s) => s[headKey]).filter((v) => v != null);
+  const workerVals = workerKey ? samples.map((s) => s[workerKey]).filter((v) => v != null) : [];
+  const all = headVals.concat(workerVals);
+  if (!all.length) { svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" class="axlabel">no data yet</text>`; return; }
+  let vmin = Math.min(...all), vmax = Math.max(...all);
+  if (opts.zeroBase) vmin = 0;
+  if (vmax === vmin) vmax = vmin + 1;
+  const pad = (vmax - vmin) * 0.1;
+  vmax += pad; if (!opts.zeroBase) vmin = Math.max(0, vmin - pad);
+
+  const scale = (s, key) => buildLine(s.map((x) => x[key]).filter((v) => v != null), W, H, P, vmin, vmax);
+  let svgParts = `<line class="ax" x1="${P}" y1="${H-P}" x2="${W-P}" y2="${H-P}"/>`;
+  svgParts += `<text class="axlabel" x="${P-4}" y="${P+4}" text-anchor="end">${Math.round(vmax)}</text>`;
+  svgParts += `<text class="axlabel" x="${P-4}" y="${H-P}" text-anchor="end">${Math.round(vmin)}</text>`;
+  if (workerKey) {
+    svgParts += `<path class="ln-worker" d="${scale(samples, workerKey)}"/>`;
+    svgParts += `<path class="ln-head" d="${scale(samples, headKey)}"/>`;
+  } else {
+    svgParts += `<path class="ln-single" d="${scale(samples, headKey)}"/>`;
+  }
+  svg.innerHTML = svgParts;
+};
+
+const loadCost = async () => {
+  const c = await api("/api/cost");
+  const card = (label, d) => `<div class="costcard"><div class="cc-label">${label}</div><div class="cc-val">$${d.cost_equiv.toFixed(2)}</div><div class="cc-sub">${fmtNum(d.tokens)} tokens</div></div>`;
+  $("cost-cards").innerHTML = card("Today", c.today) + card("This week", c.week) + card("All time", c.all)
+    + `<div class="costcard"><div class="cc-label">Rate</div><div class="cc-val" style="color:var(--muted)">$${c.rate_per_mtok}</div><div class="cc-sub">per 1M tokens</div></div>`;
+};
+
+const loadHistory = async () => {
+  const r = await api(`/api/history?window=${histWindow}`);
+  const s = r.samples;
+  drawChart("chart-tps", s, "tps", null, { zeroBase: true });
+  drawChart("chart-temp", s, "head_temp", "worker_temp");
+  drawChart("chart-power", s, "head_power", "worker_power", { zeroBase: true });
+  drawChart("chart-mem", s.map((x) => ({ ...x, head_gb: x.head_mem_used ? x.head_mem_used/1024 : null, worker_gb: x.worker_mem_used ? x.worker_mem_used/1024 : null })), "head_gb", "worker_gb", { zeroBase: true });
+};
+
+document.querySelectorAll(".hwin").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll(".hwin").forEach((x) => x.classList.toggle("active", x === b));
+    histWindow = b.getAttribute("data-win");
+    loadHistory();
+  };
+});
+
+loadCost(); loadHistory();
+setInterval(() => { loadCost(); loadHistory(); }, 15000);
 
 const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
 
@@ -622,13 +789,37 @@ const pollMetrics = async () => {
   setGauge("ns-head-mem", "ns-head-mem-pct", h.mem_used, true, h.mem_total);
   setGauge("ns-worker-gpu", "ns-worker-gpu-pct", w.gpu_util, false);
   setGauge("ns-worker-mem", "ns-worker-mem-pct", w.mem_used, true, w.mem_total);
+  // extended readouts
+  const setNe = (id, v, suffix = "") => { const el = $(id); if (el) el.textContent = v != null ? v + suffix : "--"; };
+  setNe("ns-head-power", h.power); setNe("ns-head-temp", h.temp); setNe("ns-head-clk", h.clock_sm);
+  setNe("ns-worker-power", w.power); setNe("ns-worker-temp", w.temp); setNe("ns-worker-clk", w.clock_sm);
 };
 
-tick(); pollStatus(); pollActivity(); pollMetrics();
+// ---------- download progress ----------
+const pollDownload = async () => {
+  let d;
+  try { d = await api("/api/download/status"); } catch (e) { return; }
+  const banner = $("dl-banner");
+  const showing = d.active || d.status === "error" || d.status === "loaded" || d.status === "downloaded";
+  banner.classList.toggle("hidden", !showing);
+  if (!showing) return;
+  $("dl-model").textContent = d.model || "";
+  $("dl-status").textContent = d.error ? "error" : d.status;
+  $("dl-pct").textContent = d.error ? d.error : (d.detail || `${d.percent}%`);
+  $("dl-speed").textContent = d.speed || "";
+  const fill = $("dl-fill");
+  fill.style.width = (d.error ? 100 : d.percent) + "%";
+  fill.className = "dl-fill" + (d.error ? " error" : "");
+  // when a download finishes, refresh library + curated so cached badges update
+  if (d.status === "loaded" || d.status === "downloaded") { setTimeout(() => { loadCurated(); }, 800); }
+};
+
+tick(); pollStatus(); pollActivity(); pollMetrics(); pollDownload();
 setInterval(tick, 1000);
 setInterval(pollStatus, 4000);
 setInterval(pollActivity, 3000);
 setInterval(pollMetrics, 3000);
+setInterval(pollDownload, 2000);
 </script>
 </body>
 </html>

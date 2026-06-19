@@ -19,3 +19,5 @@ discover-sparks/
 
 # OS noise
 .DS_Store
+gx10-metrics.db
+*.db

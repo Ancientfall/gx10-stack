@@ -15,6 +15,7 @@ import glob
 import time
 import json
 import shlex
+import sqlite3
 import threading
 import subprocess
 import collections
@@ -135,6 +136,121 @@ def log_line(text: str) -> None:
     stamp = time.strftime("%H:%M:%S")
     with _activity_lock:
         _activity.append({"t": stamp, "line": text})
+
+
+# ------------------------------------------------------------
+# Metrics store: SQLite history for throughput, GPU, memory, thermals, cost
+# ------------------------------------------------------------
+DB_PATH = Path(os.environ.get("GX10_DB", str(BASE_DIR / "gx10-metrics.db")))
+_db_lock = threading.Lock()
+
+# Cost comparison rate: $ per 1M generated tokens (configurable). Default ~ frontier model.
+COST_PER_MTOK = float(os.environ.get("GX10_COST_PER_MTOK", "10.0"))
+
+
+def db_init():
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS samples (
+                ts INTEGER PRIMARY KEY,
+                tps REAL, gen_total REAL,
+                head_gpu INTEGER, head_mem_used INTEGER, head_mem_total INTEGER,
+                head_temp INTEGER, head_power REAL,
+                worker_gpu INTEGER, worker_mem_used INTEGER, worker_mem_total INTEGER,
+                worker_temp INTEGER, worker_power REAL,
+                model TEXT
+            )""")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS benchmarks (
+                ts INTEGER PRIMARY KEY,
+                model TEXT, concurrency INTEGER, prompt_tokens INTEGER,
+                max_tokens INTEGER, ttft_ms REAL, tps REAL,
+                total_tokens INTEGER, duration_s REAL, notes TEXT
+            )""")
+        con.commit()
+
+
+def db_insert_sample(row: dict):
+    cols = ("ts", "tps", "gen_total", "head_gpu", "head_mem_used", "head_mem_total",
+            "head_temp", "head_power", "worker_gpu", "worker_mem_used", "worker_mem_total",
+            "worker_temp", "worker_power", "model")
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            f"INSERT OR REPLACE INTO samples ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})",
+            tuple(row.get(c) for c in cols))
+        con.commit()
+
+
+def db_history(since_seconds: int, max_points: int = 240):
+    """Return downsampled history for charts."""
+    cutoff = int(time.time()) - since_seconds
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM samples WHERE ts >= ? ORDER BY ts", (cutoff,)).fetchall()
+    rows = [dict(r) for r in rows]
+    # downsample evenly if too many points
+    if len(rows) > max_points:
+        step = len(rows) / max_points
+        rows = [rows[int(i * step)] for i in range(max_points)]
+    return rows
+
+
+def db_cost_summary():
+    """Tokens generated and cost-equivalent over windows."""
+    now = int(time.time())
+    out = {"rate_per_mtok": COST_PER_MTOK}
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        for label, secs in (("today", 86400), ("week", 604800), ("all", 10**12)):
+            cutoff = now - secs
+            r = con.execute(
+                "SELECT MIN(gen_total), MAX(gen_total) FROM samples WHERE ts >= ? AND gen_total IS NOT NULL",
+                (cutoff,)).fetchone()
+            lo, hi = r if r else (None, None)
+            tokens = (hi - lo) if (lo is not None and hi is not None and hi >= lo) else 0
+            out[label] = {
+                "tokens": int(tokens),
+                "cost_equiv": round(tokens / 1_000_000 * COST_PER_MTOK, 2),
+            }
+    return out
+
+
+# Background collector: samples every interval into SQLite
+_collector_stop = threading.Event()
+
+
+def _collect_once():
+    try:
+        m = gather_metrics()
+    except Exception:
+        return
+    s = m.get("serving", {})
+    h = m.get("nodes", {}).get("head", {})
+    w = m.get("nodes", {}).get("worker", {})
+    # tps from gen-token delta vs the previous sample
+    gen = s.get("gen_tokens_total")
+    tps = None
+    prev = getattr(_collect_once, "_prev", None)
+    nowt = time.time()
+    if gen is not None and prev is not None:
+        dt = nowt - prev[1]
+        if dt > 0:
+            tps = max(0.0, (gen - prev[0]) / dt)
+    if gen is not None:
+        _collect_once._prev = (gen, nowt)
+    db_insert_sample({
+        "ts": int(nowt), "tps": tps, "gen_total": gen,
+        "head_gpu": h.get("gpu_util"), "head_mem_used": h.get("mem_used"),
+        "head_mem_total": h.get("mem_total"), "head_temp": h.get("temp"), "head_power": h.get("power"),
+        "worker_gpu": w.get("gpu_util"), "worker_mem_used": w.get("mem_used"),
+        "worker_mem_total": w.get("mem_total"), "worker_temp": w.get("temp"), "worker_power": w.get("power"),
+        "model": cfg().get("MODEL", ""),
+    })
+
+
+def _collector_loop(interval=10):
+    db_init()
+    while not _collector_stop.wait(interval):
+        _collect_once()
 
 
 def run(cmd, timeout=20, shell=False, capture_to_activity=False):
@@ -319,19 +435,41 @@ def gather_metrics() -> dict:
     # Per-node: GPU utilization (nvidia-smi) and unified memory (free).
     # On GB10 UMA, host memory IS the GPU memory, so we report free -m.
     def node_stats(local: bool):
+        # full nvidia-smi telemetry in one call
+        fields = ("utilization.gpu,temperature.gpu,power.draw,power.limit,"
+                  "clocks.sm,clocks.mem,utilization.memory,"
+                  "memory.used,memory.total,fan.speed,pstate")
+        smi_q = f"nvidia-smi --query-gpu={fields} --format=csv,noheader,nounits"
         if local:
-            rc1, util, _ = run(["nvidia-smi", "--query-gpu=utilization.gpu",
-                                "--format=csv,noheader,nounits"], timeout=6)
+            rc1, gpu, _ = run(["sh", "-c", smi_q], timeout=6)
             rc2, mem, _ = run(["sh", "-c",
                 "free -m | awk '/^Mem:/{print $2,$3,$7}'"], timeout=6)
         else:
-            rc1, util, _ = ssh_worker(
-                "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits", timeout=8)
+            rc1, gpu, _ = ssh_worker(smi_q, timeout=8)
             rc2, mem, _ = ssh_worker("free -m | awk '/^Mem:/{print $2,$3,$7}'", timeout=8)
-        stats = {"gpu_util": None, "mem_total": None, "mem_used": None, "mem_avail": None}
-        if rc1 == 0 and util.strip():
+        stats = {"gpu_util": None, "temp": None, "power": None, "power_limit": None,
+                 "clock_sm": None, "clock_mem": None, "vram_util": None,
+                 "vram_used": None, "vram_total": None, "fan": None, "pstate": None,
+                 "mem_total": None, "mem_used": None, "mem_avail": None}
+        if rc1 == 0 and gpu.strip():
             try:
-                stats["gpu_util"] = int(util.strip().splitlines()[0])
+                p = [x.strip() for x in gpu.strip().splitlines()[0].split(",")]
+                def num(v, cast=float):
+                    try:
+                        return cast(float(v))
+                    except (ValueError, TypeError):
+                        return None
+                stats["gpu_util"] = num(p[0], int)
+                stats["temp"] = num(p[1], int)
+                stats["power"] = num(p[2])
+                stats["power_limit"] = num(p[3])
+                stats["clock_sm"] = num(p[4], int)
+                stats["clock_mem"] = num(p[5], int)
+                stats["vram_util"] = num(p[6], int)
+                stats["vram_used"] = num(p[7], int)
+                stats["vram_total"] = num(p[8], int)
+                stats["fan"] = num(p[9], int)
+                stats["pstate"] = p[10] if len(p) > 10 and p[10] not in ("", "[N/A]") else None
             except (ValueError, IndexError):
                 pass
         if rc2 == 0 and mem.strip():
@@ -505,10 +643,29 @@ def stop_cluster():
     return {"ok": True, "detail": "Stop initiated."}
 
 
-def swap_model(model: str):
+# ------------------------------------------------------------
+# Download manager: tracked background download, then auto-load
+# ------------------------------------------------------------
+_download = {
+    "active": False, "model": None, "status": "idle", "percent": 0,
+    "detail": "", "speed": "", "started": None, "error": None,
+}
+_download_lock = threading.Lock()
+
+
+def _set_dl(**kw):
+    with _download_lock:
+        _download.update(kw)
+
+
+def download_status() -> dict:
+    with _download_lock:
+        return dict(_download)
+
+
+def _start_vllm(model: str) -> tuple:
+    """Relaunch vLLM serve in the running container with the given model."""
     c = cfg()
-    write_env_value(CLUSTER_ENV, "MODEL", model)
-    log_line(f"[model] switching to {model}")
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
@@ -517,10 +674,94 @@ def swap_model(model: str):
         f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {c['MAX_MODEL_LEN']} "
         f"> /var/log/vllm.log 2>&1"
     )
-    rc, _, err = run(["docker", "exec", "-d", CONTAINER, "bash", "-c", serve], timeout=15)
-    if rc != 0:
-        return {"ok": False, "detail": f"Relaunch failed: {err}. Is the cluster running?"}
-    return {"ok": True, "detail": f"Reloading with {model}. Loading takes a few minutes."}
+    return run(["docker", "exec", "-d", CONTAINER, "bash", "-c", serve], timeout=15)
+
+
+def _download_worker(model: str, auto_load: bool):
+    """Download weights into the cache with progress, then optionally load."""
+    c = cfg()
+    token = c.get("HF_TOKEN", "")
+    _set_dl(active=True, model=model, status="downloading", percent=0,
+            detail="Starting download...", speed="", error=None, started=time.time())
+    log_line(f"[download] starting {model}")
+
+    # huggingface-cli runs inside the container, writing to the mounted cache.
+    # --quiet off so we can parse progress. Token passed via env if present.
+    env_prefix = f"HF_TOKEN={token} " if token else ""
+    cmd = (f"{env_prefix}huggingface-cli download '{model}' "
+           f"--exclude '*.pth' '*.bin.index.json.*' 2>&1")
+
+    proc = subprocess.Popen(
+        ["docker", "exec", CONTAINER, "bash", "-lc", cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    last_pct = 0
+    pat_pct = re.compile(r'(\d+)%')
+    pat_speed = re.compile(r'([\d.]+[KMG]B/s)')
+    saw_error = None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        # surface gated/auth and not-found errors clearly
+        low = line.lower()
+        if "401" in line or "gated" in low or "awaiting a review" in low or "restricted" in low:
+            saw_error = "Model is gated. Set HF_TOKEN in cluster.env and request access on Hugging Face."
+        elif "404" in line or "repository not found" in low:
+            saw_error = "Model not found. Check the exact repo id."
+        elif "no space left" in low:
+            saw_error = "Out of disk space in the cache volume."
+        m = pat_pct.search(line)
+        if m:
+            pct = int(m.group(1))
+            if pct >= last_pct:
+                last_pct = pct
+                sp = pat_speed.search(line)
+                _set_dl(percent=pct, detail=f"Downloading {model}", speed=sp.group(1) if sp else "")
+    proc.wait()
+
+    if saw_error or proc.returncode != 0:
+        msg = saw_error or f"Download failed (exit {proc.returncode}). See activity log."
+        _set_dl(active=False, status="error", error=msg, detail=msg)
+        log_line(f"[download] FAILED {model}: {msg}")
+        return
+
+    _set_dl(percent=100, status="downloaded", detail=f"{model} downloaded.")
+    log_line(f"[download] complete {model}")
+
+    if auto_load:
+        _set_dl(status="loading", detail=f"Loading {model} into the cluster...")
+        log_line(f"[download] auto-loading {model}")
+        write_env_value(CLUSTER_ENV, "MODEL", model)
+        rc, _, err = _start_vllm(model)
+        if rc != 0:
+            _set_dl(active=False, status="error", error=f"Load failed: {err}")
+            return
+        _set_dl(active=False, status="loaded", detail=f"{model} loading. Ready in a few minutes.")
+    else:
+        _set_dl(active=False)
+
+
+def start_download(model: str, auto_load: bool = True):
+    with _download_lock:
+        if _download["active"]:
+            return {"ok": False, "detail": f"A download is already running: {_download['model']}"}
+    threading.Thread(target=_download_worker, args=(model, auto_load), daemon=True).start()
+    return {"ok": True, "detail": f"Download started for {model}."}
+
+
+def swap_model(model: str):
+    """If already cached, load immediately; otherwise kick off a tracked download then load."""
+    cached = {m["id"] for m in hf_cache_models()}
+    if model in cached:
+        write_env_value(CLUSTER_ENV, "MODEL", model)
+        log_line(f"[model] switching to cached {model}")
+        rc, _, err = _start_vllm(model)
+        if rc != 0:
+            return {"ok": False, "detail": f"Relaunch failed: {err}. Is the cluster running?"}
+        return {"ok": True, "detail": f"Loading cached {model}. Ready in a few minutes."}
+    # not cached: download with progress, then auto-load
+    return start_download(model, auto_load=True)
 
 
 def vllm_logs(lines=120):
@@ -592,7 +833,7 @@ def curated_models() -> list:
     return result
 
 
-def hf_search(query: str, limit: int = 12) -> list:
+def hf_search(query: str, limit: int = 60) -> list:
     """Live Hugging Face model search. Public API, no auth needed for public models."""
     if not query.strip():
         return []
@@ -764,10 +1005,37 @@ def api_models_test(payload: dict = Body(...)):
     return JSONResponse(test_prompt(prompt, int(payload.get("max_tokens", 128))))
 
 
+@app.get("/api/download/status")
+def api_download_status():
+    return JSONResponse(download_status())
+
+
+@app.post("/api/download")
+def api_download(payload: dict = Body(...)):
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"ok": False, "detail": "No model provided"}, status_code=400)
+    return JSONResponse(start_download(model, auto_load=payload.get("auto_load", True)))
+
+
+@app.get("/api/history")
+def api_history(window: str = "hour"):
+    secs = {"hour": 3600, "day": 86400, "week": 604800}.get(window, 3600)
+    return JSONResponse({"window": window, "samples": db_history(secs)})
+
+
+@app.get("/api/cost")
+def api_cost():
+    return JSONResponse(db_cost_summary())
+
+
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
     log_line(f"Panel starting. Kit dir: {KIT_DIR}")
+    db_init()
+    threading.Thread(target=_collector_loop, daemon=True).start()
+    log_line(f"Metrics collector started (db: {DB_PATH.name}, cost rate ${COST_PER_MTOK}/Mtok)")
     uvicorn.run(app, host=PANEL_HOST, port=PANEL_PORT, log_level="warning")
