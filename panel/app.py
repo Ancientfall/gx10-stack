@@ -663,28 +663,51 @@ def download_status() -> dict:
         return dict(_download)
 
 
-def _start_vllm(model: str) -> tuple:
+def _start_vllm(model: str, max_len_override: int = None) -> tuple:
     """Relaunch vLLM serve in the running container with the given model."""
     c = cfg()
+    max_len = max_len_override if max_len_override else c["MAX_MODEL_LEN"]
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
         f"vllm serve '{model}' --host 0.0.0.0 --port {c['API_PORT']} "
         f"--tensor-parallel-size {c['TENSOR_PARALLEL']} --distributed-executor-backend ray "
-        f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {c['MAX_MODEL_LEN']} "
+        f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {max_len} "
         f"> /var/log/vllm.log 2>&1"
     )
     return run(["docker", "exec", "-d", CONTAINER, "bash", "-c", serve], timeout=15)
 
 
-def _watch_vllm_until_ready(model: str, timeout_s: int = 1200):
-    """Poll the vLLM log + API to report load phases until the model serves or fails."""
+def _explain_error(log: str) -> str:
+    """Turn a raw vLLM error into a plain-language reason."""
+    low = log.lower()
+    if "keyerror" in low and ("_scale" in low or "experts" in low):
+        return "Model uses a quantization format this vLLM build can't load (missing weight mapping). Needs a newer vLLM image."
+    if "derived max_model_len" in low:
+        return "Context length too high for this model (auto-correcting)."
+    if "out of memory" in low or "oom" in low or "cuda error" in low:
+        return "Out of memory. Lower GPU mem util or max model length, or pick a smaller model."
+    if "unsupported" in low and "quant" in low:
+        return "Quantization format not supported by this vLLM build."
+    if "no module named" in low or "importerror" in low:
+        return "Model needs a dependency this image doesn't have. Needs a newer vLLM image."
+    if "trust_remote_code" in low:
+        return "Model requires trust_remote_code, which isn't enabled."
+    # fall back to the most specific error line
+    for l in log.splitlines()[::-1]:
+        ll = l.lower()
+        if any(k in ll for k in ("error:", "valueerror", "runtimeerror", "keyerror", "assert")):
+            return re.sub(r"^.*?((Value|Runtime|Key|OS)Error|AssertionError|Error)", r"\1", l).strip()[:200]
+    return "Engine failed to start. See vLLM logs for details."
+
+
+def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -> bool:
+    """Poll until the model serves (return True) or fails (return False)."""
     c = cfg()
     port = c["API_PORT"]
     start = time.time()
     phase = "loading"
     while time.time() - start < timeout_s:
-        # is the API serving this model yet?
         rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{port}/v1/models"], timeout=5)
         if rc == 0 and out:
             try:
@@ -693,30 +716,43 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200):
                     _set_dl(active=False, status="ready", percent=100,
                             detail=f"{model} is live and serving.", error=None)
                     log_line(f"[model] {model} is ready and serving")
-                    return
+                    return True
             except Exception:
                 pass
-        # read the tail to report which phase we're in
-        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "8", "/var/log/vllm.log"], timeout=8)
+        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "40", "/var/log/vllm.log"], timeout=8)
         if rc2 == 0 and log:
             low = log.lower()
-            if "error" in low or "traceback" in low or "exited" in low:
-                # capture a concise error line
-                errline = next((l for l in log.splitlines()[::-1] if "error" in l.lower()), "Load error")
-                _set_dl(active=False, status="error", error=errline[:160], detail=errline[:160])
-                log_line(f"[model] load error: {errline[:160]}")
-                return
+            # auto-correct context length once
+            mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
+            if mlen and not _retried:
+                real_max = int(mlen.group(1))
+                log_line(f"[model] {model} caps context at {real_max}; retrying")
+                _set_dl(active=True, status="loading",
+                        detail=f"{model} max context is {real_max}, retrying...")
+                _start_vllm(model, max_len_override=real_max)
+                _model_maxlen_cache[model] = real_max
+                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
+            # fatal error?
+            if ("engine core initialization failed" in low or "traceback (most recent call last)" in low
+                    or "raise runtimeerror" in low):
+                reason = _explain_error(log)
+                _set_dl(active=False, status="error", error=reason, detail=reason)
+                log_line(f"[model] load FAILED: {reason}")
+                return False
             if "capturing" in low or "graph" in low or "compile" in low:
                 phase = "compiling"
-            elif "loading safetensors" in low or "loading weights" in low or "loading model" in low:
+            elif "loading safetensors" in low or "loading weights" in low:
                 phase = "loading weights"
-            elif "download" in low:
-                phase = "downloading weights"
         elapsed = int(time.time() - start)
         _set_dl(active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
         time.sleep(5)
     _set_dl(active=False, status="error", error="Timed out waiting for the model to load.",
-            detail="Load timed out. Check the activity log / vLLM logs.")
+            detail="Load timed out. Check the vLLM logs.")
+    return False
+
+
+# remembers per-model context caps discovered via auto-correction
+_model_maxlen_cache = {}
 
 
 def _download_worker(model: str, auto_load: bool):
@@ -772,7 +808,7 @@ def _download_worker(model: str, auto_load: bool):
         write_env_value(CLUSTER_ENV, "MODEL", model)
         _set_dl(active=True, status="loading", detail=f"Starting {model} on the cluster...")
         log_line(f"[model] auto-loading {model}")
-        rc, _, err = _start_vllm(model)
+        rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
         if rc != 0:
             _set_dl(active=False, status="error", error=f"Load failed: {err}")
             return
@@ -781,17 +817,46 @@ def _download_worker(model: str, auto_load: bool):
         _set_dl(active=False, status="downloaded")
 
 
+def currently_serving() -> str:
+    """What the API is actually serving right now, or '' if nothing."""
+    c = cfg()
+    rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{c['API_PORT']}/v1/models"], timeout=5)
+    if rc == 0 and out:
+        try:
+            return json.loads(out)["data"][0]["id"]
+        except Exception:
+            return ""
+    return ""
+
+
 def _load_worker(model: str):
-    """Load an already-cached model and watch it through to ready."""
+    """Load a cached model with rollback: if it fails, restore the previous one."""
+    previous = currently_serving()
     write_env_value(CLUSTER_ENV, "MODEL", model)
     _set_dl(active=True, model=model, status="loading", percent=0,
             detail=f"Starting {model}...", speed="", error=None, started=time.time())
-    log_line(f"[model] loading cached {model}")
-    rc, _, err = _start_vllm(model)
+    log_line(f"[model] loading {model}" + (f" (was {previous})" if previous else ""))
+    rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
     if rc != 0:
-        _set_dl(active=False, status="error", error=f"Relaunch failed: {err}. Is the cluster running?")
+        _set_dl(active=False, status="error", error=f"Could not start: {err}")
         return
-    _watch_vllm_until_ready(model)
+    ok = _watch_vllm_until_ready(model)
+    if ok:
+        return
+    # failed: roll back to the previous working model if there was one
+    if previous and previous != model:
+        log_line(f"[model] rolling back to {previous}")
+        cur = download_status()
+        _set_dl(active=True, model=previous, status="loading",
+                detail=f"Load failed. Rolling back to {previous}...",
+                error=cur.get("error"))
+        write_env_value(CLUSTER_ENV, "MODEL", previous)
+        rc2, _, _ = _start_vllm(previous, _model_maxlen_cache.get(previous))
+        if rc2 == 0 and _watch_vllm_until_ready(previous):
+            _set_dl(active=False, status="error",
+                    error=f"{model} failed to load. Rolled back to {previous}.",
+                    detail=f"{model} failed. {previous} restored and serving.")
+            log_line(f"[model] rolled back to {previous} after {model} failed")
 
 
 def start_download(model: str, auto_load: bool = True):
@@ -803,7 +868,7 @@ def start_download(model: str, auto_load: bool = True):
 
 
 def swap_model(model: str):
-    """Cached -> load + watch. Not cached -> download + auto-load + watch."""
+    """Cached -> load + watch (with rollback). Not cached -> download + auto-load."""
     with _download_lock:
         if _download["active"]:
             return {"ok": False, "detail": f"Busy: {_download['model']} ({_download['status']})"}
@@ -813,6 +878,43 @@ def swap_model(model: str):
         return {"ok": True, "detail": f"Loading cached {model}..."}
     threading.Thread(target=_download_worker, args=(model, True), daemon=True).start()
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
+
+
+def preload_check(model: str) -> dict:
+    """Tell the user what will happen before they load a model."""
+    c = cfg()
+    cached_ids = {m["id"] for m in hf_cache_models()}
+    is_cached = model in cached_ids
+    serving = currently_serving()
+    # fit estimate from curated/known params or name guess
+    params = next((m["params_b"] for m in CURATED_MODELS if m["id"] == model), None) \
+        or _guess_params_from_name(model)
+    fit = _fit_label(params) if params else {"fit": "unknown", "footprint_gb": None,
+                                             "note": "Size unknown; check the model card."}
+    warnings = []
+    notes = []
+    if not is_cached:
+        notes.append("Not cached yet, it will download first (can take minutes).")
+    else:
+        notes.append("Already cached, loads without downloading.")
+    if serving:
+        warnings.append(f"This replaces the model currently serving ({serving}). It will be unloaded.")
+    if fit["fit"] == "toobig":
+        warnings.append(f"Estimated footprint (~{fit['footprint_gb']}GB) exceeds your pooled memory. Likely won't load.")
+    elif fit["fit"] == "cluster":
+        notes.append("Needs both nodes (TP=2).")
+    elif fit["fit"] == "single":
+        notes.append("Fits on a single node.")
+    # known-risky formats
+    low = model.lower()
+    if "nvfp4" in low or "fp4" in low or "qwen3.5" in low or "qwen3.6" in low:
+        warnings.append("Uses a newer quantization/architecture that this vLLM build may not support. May fail to load.")
+    return {
+        "model": model, "cached": is_cached, "currently_serving": serving,
+        "fit": fit["fit"], "footprint_gb": fit["footprint_gb"],
+        "warnings": warnings, "notes": notes,
+        "ok_to_load": fit["fit"] != "toobig",
+    }
 
 
 def unload_model():
@@ -976,6 +1078,148 @@ def test_prompt(prompt: str, max_tokens: int = 128) -> dict:
 
 
 # ------------------------------------------------------------
+# Image / vLLM version manager: pull newer NGC base, rebuild, switch, rollback
+# ------------------------------------------------------------
+NGC_REPO = "nvcr.io/nvidia/vllm"
+LOCAL_IMAGE_TAG = "gx10/vllm-ray"
+
+_image_job = {"active": False, "status": "idle", "percent": 0, "detail": "", "error": None, "target": None}
+_image_lock = threading.Lock()
+
+
+def _set_img(**kw):
+    with _image_lock:
+        _image_job.update(kw)
+
+
+def image_status() -> dict:
+    with _image_lock:
+        return dict(_image_job)
+
+
+def current_vllm_version() -> dict:
+    ver, base = None, cfg().get("VLLM_IMAGE", "")
+    rc, out, _ = run(["docker", "exec", CONTAINER, "python3", "-c",
+                      "import vllm; print(vllm.__version__)"], timeout=10)
+    if rc == 0 and out.strip():
+        ver = out.strip().splitlines()[-1]
+    return {"vllm_version": ver, "image": base}
+
+
+def list_local_images() -> list:
+    rc, out, _ = run(["docker", "images", LOCAL_IMAGE_TAG, "--format", "{{.Tag}}|{{.Size}}|{{.CreatedSince}}"], timeout=10)
+    imgs = []
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3:
+                imgs.append({"tag": parts[0], "size": parts[1], "created": parts[2]})
+    return imgs
+
+
+def check_ngc_tag(tag: str) -> dict:
+    rc, out, err = run(["docker", "manifest", "inspect", f"{NGC_REPO}:{tag}"], timeout=25)
+    blob = (out + err).lower()
+    if rc == 0:
+        return {"tag": tag, "available": True}
+    if "no such manifest" in blob or "not found" in blob or "manifest unknown" in blob:
+        return {"tag": tag, "available": False, "reason": "not released"}
+    if "unauthorized" in blob or "denied" in blob:
+        return {"tag": tag, "available": False, "reason": "needs docker login nvcr.io"}
+    return {"tag": tag, "available": False, "reason": "unreachable"}
+
+
+def _image_build_worker(ngc_tag: str):
+    c = cfg()
+    local = f"{LOCAL_IMAGE_TAG}:{ngc_tag}"
+    base = f"{NGC_REPO}:{ngc_tag}"
+    worker_host = c["WORKER_SSH_HOST"]
+    user = c["CLUSTER_USER"]
+    _set_img(active=True, status="pulling", percent=0, error=None, target=ngc_tag,
+             detail=f"Pulling {base} on head...")
+    log_line(f"[image] pulling {base} on both nodes")
+
+    def pull(host_cmd, where):
+        proc = subprocess.Popen(host_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        pat = re.compile(r'(\d+)%')
+        for line in proc.stdout:
+            m = pat.search(line)
+            if m:
+                _set_img(status="pulling", percent=int(m.group(1)), detail=f"Pulling base on {where}...")
+        proc.wait()
+        return proc.returncode
+
+    if pull(["docker", "pull", base], "head") != 0:
+        _set_img(active=False, status="error", error=f"Failed to pull {base} on head."); return
+    _set_img(status="pulling", percent=50, detail="Pulling base on worker...")
+    if pull(["ssh", "-o", "BatchMode=yes", f"{user}@{worker_host}", f"docker pull {base}"], "worker") != 0:
+        _set_img(active=False, status="error", error=f"Failed to pull {base} on worker."); return
+
+    _set_img(status="building", percent=70, detail="Building ray layer on head...")
+    log_line(f"[image] building {local} on both nodes")
+    dockerfile = str(KIT_DIR / "Dockerfile.ray")
+    rcb1, _, eb1 = run(["docker", "build", "-f", dockerfile, "--build-arg", f"BASE={base}",
+                        "-t", local, str(KIT_DIR)], timeout=900, capture_to_activity=True)
+    if rcb1 != 0:
+        _set_img(active=False, status="error", error=f"Build failed on head: {eb1[:120]}"); return
+    _set_img(status="building", percent=88, detail="Building ray layer on worker...")
+    run(["ssh", "-o", "BatchMode=yes", f"{user}@{worker_host}", "mkdir -p ~/.gx10-build"], timeout=15)
+    run(["scp", dockerfile, f"{user}@{worker_host}:~/.gx10-build/Dockerfile.ray"], timeout=20)
+    rcb2, _, _ = run(["ssh", "-o", "BatchMode=yes", f"{user}@{worker_host}",
+                      f"docker build -f ~/.gx10-build/Dockerfile.ray --build-arg BASE={base} -t {local} ~/.gx10-build"],
+                     timeout=900)
+    if rcb2 != 0:
+        _set_img(active=False, status="error", error="Build failed on worker."); return
+
+    _set_img(active=False, status="built", percent=100,
+             detail=f"{local} built on both nodes. Switch the cluster to use it.")
+    log_line(f"[image] {local} ready on both nodes")
+
+
+def start_image_update(ngc_tag: str):
+    with _image_lock:
+        if _image_job["active"]:
+            return {"ok": False, "detail": "An image job is already running."}
+    chk = check_ngc_tag(ngc_tag)
+    if not chk["available"]:
+        return {"ok": False, "detail": f"Tag {ngc_tag} unavailable: {chk.get('reason')}"}
+    threading.Thread(target=_image_build_worker, args=(ngc_tag,), daemon=True).start()
+    return {"ok": True, "detail": f"Updating to {ngc_tag}. Pulls ~19GB per node."}
+
+
+def switch_image(ngc_tag: str):
+    local = f"{LOCAL_IMAGE_TAG}:{ngc_tag}"
+    rc, _, _ = run(["docker", "image", "inspect", local], timeout=10)
+    if rc != 0:
+        return {"ok": False, "detail": f"{local} not built yet. Update first."}
+    write_env_value(CLUSTER_ENV, "VLLM_IMAGE", local)
+    log_line(f"[image] switching cluster to {local} (relaunch required)")
+    return {"ok": True, "detail": f"Set to {local}. Stop then Start to relaunch on the new image.",
+            "needs_relaunch": True}
+
+
+def image_overview() -> dict:
+    cur = current_vllm_version()
+    locals_ = list_local_images()
+    cur_tag = ""
+    m = re.search(r":(\d+\.\d+)-py3", cur.get("image", ""))
+    if m:
+        cur_tag = m.group(1)
+    candidates = []
+    if cur_tag:
+        try:
+            yy, mm = cur_tag.split(".")
+            for delta in (1, 2):
+                nm = int(mm) + delta
+                ny, nmo = (int(yy), nm) if nm <= 12 else (int(yy) + 1, nm - 12)
+                candidates.append(f"{ny:02d}.{nmo:02d}-py3")
+        except ValueError:
+            pass
+    available = [check_ngc_tag(t) for t in candidates]
+    return {"current": cur, "local_images": locals_, "current_ngc_tag": cur_tag, "candidates": available}
+
+
+# ------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------
 app = FastAPI(title="GX10 Cluster Panel")
@@ -1085,6 +1329,14 @@ def api_download_dismiss():
     return JSONResponse(dismiss_status())
 
 
+@app.post("/api/model/preload-check")
+def api_preload_check(payload: dict = Body(...)):
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"ok": False, "detail": "No model provided"}, status_code=400)
+    return JSONResponse(preload_check(model))
+
+
 @app.post("/api/model/unload")
 def api_model_unload():
     return JSONResponse(unload_model())
@@ -1107,6 +1359,32 @@ def api_history(window: str = "hour"):
 @app.get("/api/cost")
 def api_cost():
     return JSONResponse(db_cost_summary())
+
+
+@app.get("/api/image/overview")
+def api_image_overview():
+    return JSONResponse(image_overview())
+
+
+@app.get("/api/image/status")
+def api_image_status():
+    return JSONResponse(image_status())
+
+
+@app.post("/api/image/update")
+def api_image_update(payload: dict = Body(...)):
+    tag = (payload.get("tag") or "").strip()
+    if not tag:
+        return JSONResponse({"ok": False, "detail": "No tag provided"}, status_code=400)
+    return JSONResponse(start_image_update(tag))
+
+
+@app.post("/api/image/switch")
+def api_image_switch(payload: dict = Body(...)):
+    tag = (payload.get("tag") or "").strip()
+    if not tag:
+        return JSONResponse({"ok": False, "detail": "No tag provided"}, status_code=400)
+    return JSONResponse(switch_image(tag))
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

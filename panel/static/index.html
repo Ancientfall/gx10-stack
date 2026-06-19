@@ -172,6 +172,19 @@
   .pager button { padding: 7px 16px; font-size: 13px; }
   .pg-info { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 
+  /* image / version manager */
+  .imgpane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 26px; }
+  .imgcur { font-family: var(--mono); font-size: 13px; color: var(--text); margin-bottom: 12px; }
+  .imgcur b { color: var(--fabric); }
+  .imgrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; }
+  .imgrow .ir-tag { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .imgrow .ir-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .imgrow .ir-act { display: flex; gap: 8px; }
+  .imgrow button { padding: 6px 14px; font-size: 12.5px; }
+  .imgbanner { border: 1px solid var(--fabric-dim); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+  .ir-new { color: var(--fabric); }
+  .ir-have { color: var(--up); }
+
   /* history + cost */
   .histbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
   .histwin { display: flex; gap: 6px; }
@@ -356,6 +369,19 @@
         <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
       </div>
     </div>
+  </div>
+
+  <h2 class="sec">vLLM version &amp; image</h2>
+  <div class="imgpane">
+    <div class="imgcur" id="img-current">Checking version...</div>
+    <div class="imgbanner hidden" id="img-banner">
+      <div class="dl-head"><span id="img-status">working</span></div>
+      <div class="dl-track"><div class="dl-fill" id="img-fill"></div></div>
+      <div class="dl-meta"><span id="img-detail"></span></div>
+    </div>
+    <div id="img-candidates"></div>
+    <div id="img-locals"></div>
+    <p class="hint">Updating pulls a newer NVIDIA-validated image (~19GB per node) and rebuilds the Ray layer, keeping your current image so you can roll back. Switching requires a cluster relaunch (Stop then Start). Newer images may add support for the latest model formats (e.g. NVFP4).</p>
   </div>
 
   <h2 class="sec">History &amp; cost</h2>
@@ -615,12 +641,24 @@ const wireLoadButtons = (container) => {
       const model = btn.getAttribute("data-model");
       btn.disabled = true;
       const original = btn.textContent;
-      btn.textContent = "Starting...";
-      toast(`Requesting ${model}...`);
+      btn.textContent = "Checking...";
+      // pre-load check: tell the user what will happen
+      let chk;
+      try { chk = await api("/api/model/preload-check", "POST", { model }); }
+      catch (e) { chk = null; }
+      btn.disabled = false; btn.textContent = original;
+      if (chk) {
+        const lines = [];
+        lines.push(chk.cached ? "Already cached, loads without downloading." : "Not cached, will download first.");
+        if (chk.currently_serving) lines.push(`Replaces currently serving: ${chk.currently_serving}`);
+        chk.warnings.forEach((w) => lines.push("⚠ " + w));
+        const proceed = confirm(`Load ${model}?\n\n${lines.join("\n")}\n\n${chk.ok_to_load ? "Proceed?" : "This will likely fail. Try anyway?"}`);
+        if (!proceed) return;
+      }
+      btn.disabled = true; btn.textContent = "Starting...";
       const r = await api("/api/model", "POST", { model });
       toast(r.detail);
       if (!r.ok) { btn.disabled = false; btn.textContent = original; }
-      // the job banner takes over from here; poll it immediately
       pollDownload(); pollActivity();
     };
   });
@@ -778,6 +816,75 @@ document.querySelectorAll(".hwin").forEach((b) => {
 
 loadCost(); loadHistory();
 setInterval(() => { loadCost(); loadHistory(); }, 15000);
+
+// ---------- vLLM version / image manager ----------
+const loadImageOverview = async () => {
+  let o;
+  try { o = await api("/api/image/overview"); } catch (e) { return; }
+  const cur = o.current || {};
+  $("img-current").innerHTML = `Running vLLM <b>${cur.vllm_version || "unknown"}</b> · image <b>${cur.image || "?"}</b>`;
+
+  // available newer NGC tags
+  const cands = (o.candidates || []).filter((c) => c.available);
+  const cdiv = $("img-candidates");
+  if (cands.length) {
+    cdiv.innerHTML = cands.map((c) => `
+      <div class="imgrow">
+        <div><div class="ir-tag ir-new">${c.tag}</div><div class="ir-meta">available on NGC, newer than current</div></div>
+        <div class="ir-act"><button class="img-update" data-tag="${c.tag}">Pull &amp; build</button></div>
+      </div>`).join("");
+  } else {
+    cdiv.innerHTML = '<p class="hint">No newer NGC tags detected right now. You are likely on the latest.</p>';
+  }
+  cdiv.querySelectorAll(".img-update").forEach((b) => {
+    b.onclick = async () => {
+      const tag = b.getAttribute("data-tag");
+      if (!confirm(`Pull and build ${tag}? This downloads ~19GB on each node and rebuilds the Ray layer. Your current image is kept for rollback.`)) return;
+      b.disabled = true;
+      toast((await api("/api/image/update", "POST", { tag })).detail);
+      pollImage();
+    };
+  });
+
+  // locally built images you can switch/rollback to
+  const locals = o.local_images || [];
+  const ldiv = $("img-locals");
+  if (locals.length) {
+    ldiv.innerHTML = `<p class="hint" style="margin-top:12px">Built images (switch or roll back):</p>` + locals.map((l) => `
+      <div class="imgrow">
+        <div><div class="ir-tag ir-have">gx10/vllm-ray:${l.tag}</div><div class="ir-meta">${l.size} · ${l.created}</div></div>
+        <div class="ir-act"><button class="img-switch" data-tag="${l.tag}">Use this</button></div>
+      </div>`).join("");
+    ldiv.querySelectorAll(".img-switch").forEach((b) => {
+      b.onclick = async () => {
+        const tag = b.getAttribute("data-tag");
+        if (!confirm(`Switch the cluster to gx10/vllm-ray:${tag}? The cluster will need a relaunch (Stop then Start).`)) return;
+        const r = await api("/api/image/switch", "POST", { tag });
+        toast(r.detail);
+      };
+    });
+  } else {
+    ldiv.innerHTML = "";
+  }
+};
+
+const pollImage = async () => {
+  let s;
+  try { s = await api("/api/image/status"); } catch (e) { return; }
+  const banner = $("img-banner");
+  const showing = s.active || s.status === "built" || s.status === "error";
+  banner.classList.toggle("hidden", !showing);
+  if (!showing) return;
+  $("img-status").textContent = s.error ? "error: " + s.error : s.status;
+  $("img-detail").textContent = s.detail || "";
+  const fill = $("img-fill");
+  fill.style.width = (s.percent || 0) + "%";
+  fill.className = "dl-fill" + (s.status === "error" ? " error" : "");
+  if (s.status === "built") { setTimeout(loadImageOverview, 1000); }
+};
+
+loadImageOverview();
+setInterval(pollImage, 2500);
 
 const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
 
