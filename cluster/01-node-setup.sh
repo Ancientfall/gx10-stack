@@ -106,33 +106,41 @@ docker run --rm --gpus all "${VLLM_IMAGE}" nvidia-smi >/dev/null 2>&1 \
 # 4. Detect the live ConnectX-7 interface
 # ------------------------------------------------------------
 log "Detecting ConnectX-7 QSFP interface"
+CX7_IFACE=""
+CX7_LINK_UP=0
 if ! command -v ibdev2netdev >/dev/null 2>&1; then
-    fail "ibdev2netdev not found. infiniband-diags install failed."
+    warn "ibdev2netdev not found (infiniband-diags missing). Skipping fabric setup."
+else
+    # Prefer the first CX7 port reporting link Up. Cable must be in the SAME port
+    # number on both boxes. Match the parenthesized "(Up)" and take the field
+    # right before it (robust to spacing and the "==>" arrow).
+    CX7_IFACE="$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print $(NF-1); exit}')"
+    if [[ -n "${CX7_IFACE}" ]]; then
+        CX7_LINK_UP=1
+        echo "Active CX7 interface: ${CX7_IFACE}"
+    else
+        # No link up: record the first CX7 netdev (any state) but do not block -
+        # single-node serving does not need the fabric.
+        CX7_IFACE="$(ibdev2netdev 2>/dev/null | awk 'NR==1 {print $(NF-1)}')"
+        echo
+        ibdev2netdev || true
+        warn "No CX7 port is Up. Continuing without the fabric (fine for single-node)."
+        warn "For a two-node cluster, cable the SAME QSFP port on both GX10s and re-run."
+    fi
 fi
-
-# Pick the first CX7 port reporting link Up. Cable must be plugged into the
-# SAME port number on both boxes before running this.
-# Match the parenthesized "(Up)" and take the field right before it. This is
-# robust to spacing and the "==>" arrow, unlike a fixed column index.
-CX7_IFACE="$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print $(NF-1); exit}')"
-
-if [[ -z "${CX7_IFACE}" ]]; then
-    echo
-    ibdev2netdev || true
-    fail "No CX7 port is Up. Plug the QSFP cable into the SAME port number on both GX10s, then re-run."
-fi
-echo "Active CX7 interface: ${CX7_IFACE}"
 
 # Persist for the launch script
 echo "CX7_IFACE=${CX7_IFACE}" > /etc/gx10-cluster.conf
 echo "NODE_ROLE=${ROLE}" >> /etc/gx10-cluster.conf
 echo "NODE_IP=${NODE_IP}" >> /etc/gx10-cluster.conf
+echo "CX7_LINK_UP=${CX7_LINK_UP}" >> /etc/gx10-cluster.conf
 
 # ------------------------------------------------------------
-# 5. Netplan: static IP + jumbo frames on the CX7 link
+# 5. Netplan: static IP + jumbo frames on the CX7 link (only when a link is up)
 # ------------------------------------------------------------
-log "Writing netplan for ${CX7_IFACE} -> ${NODE_IP}/${CX7_SUBNET_PREFIX}, MTU 9000"
-cat > /etc/netplan/60-cx7-cluster.yaml <<EOF
+if [[ -n "${CX7_IFACE}" ]]; then
+    log "Writing netplan for ${CX7_IFACE} -> ${NODE_IP}/${CX7_SUBNET_PREFIX}, MTU 9000"
+    cat > /etc/netplan/60-cx7-cluster.yaml <<EOF
 network:
   version: 2
   ethernets:
@@ -142,10 +150,17 @@ network:
         - ${NODE_IP}/${CX7_SUBNET_PREFIX}
       mtu: 9000
 EOF
-chmod 600 /etc/netplan/60-cx7-cluster.yaml
-netplan apply
-sleep 3
-ip -br addr show "${CX7_IFACE}"
+    chmod 600 /etc/netplan/60-cx7-cluster.yaml
+    if [[ "${CX7_LINK_UP}" == "1" ]]; then
+        netplan apply
+        sleep 3
+        ip -br addr show "${CX7_IFACE}" || true
+    else
+        warn "CX7 link down - wrote netplan but did not apply it (avoids bouncing your SSH). It applies on next boot, or re-run once cabled."
+    fi
+else
+    warn "No ConnectX-7 interface detected - skipping fabric netplan. Single-node serving is unaffected."
+fi
 
 # ------------------------------------------------------------
 # 6. Sysctl tuning for the 200G fabric
