@@ -39,6 +39,10 @@ second GX10 sits idle. `03-verify.sh` will flag the fabric / 2-GPU checks as dow
 in this mode - that is expected. The web panel exposes the same choice as a
 **Single node / Both nodes** toggle and recommends one from the model's size.
 
+`01-node-setup.sh` no longer hard-requires the fabric: if no ConnectX-7 link is
+up it warns and continues (and skips `netplan apply`, so it won't bounce your SSH),
+so you can set up and serve on one box before — or without — cabling the link.
+
 ## Alternative engine: spark-vllm-docker
 
 For the broadest model and quantization coverage on GB10 (latest vLLM +
@@ -46,6 +50,24 @@ FlashInfer, NVFP4 FP4-MoE, AWQ/GPTQ, recipes and per-model mods), you can run
 [`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker) as the
 orchestrator and still drive it from the GX10 panel. See
 [`SPARK-VLLM.md`](SPARK-VLLM.md). The native kit here remains the fallback.
+
+> Note: the spark engine's autodiscovery expects **both** ConnectX-7 ports cabled
+> between the boxes (2 active interfaces). The native kit needs only one cable.
+
+## Cleaning up disk
+
+vLLM images (~19GB each), Docker build cache, and the HuggingFace model cache add
+up fast. `cleanup.sh` reports usage and reclaims the safe stuff:
+
+```bash
+./cleanup.sh             # report only (images, build cache, model cache, disk)
+./cleanup.sh --prune     # + stopped containers, dangling images, build cache
+./cleanup.sh --prune -c  # also run on the worker over SSH
+```
+
+It prints (but never auto-runs) the bigger node-specific wins: removing old images
+with `docker rmi`, deleting cached models under `$HF_CACHE_DIR/hub/models--*`, and
+clearing `~/.cache/vllm` / `~/.cache/flashinfer` / `~/.triton` from spark builds.
 
 ## Hardware reality check
 
