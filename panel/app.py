@@ -519,6 +519,18 @@ def gather_status() -> dict:
     else:
         overall = "ok"
     running = api_ok or ray_ok
+
+    # recommend single vs two-node serving from the current model's memory fit
+    model = c.get("MODEL", "")
+    params = next((m["params_b"] for m in CURATED_MODELS if m["id"] == model), None) \
+        or _guess_params_from_name(model)
+    fit = _fit_label(params)["fit"] if params else "unknown"
+    recommended = "single" if fit == "single" else ("cluster" if fit in ("cluster", "toobig") else "")
+    try:
+        cur_tp = int(c.get("TENSOR_PARALLEL", "2") or 2)
+    except ValueError:
+        cur_tp = 2
+
     return {
         "overall": overall,
         "running": running,
@@ -529,6 +541,11 @@ def gather_status() -> dict:
             "worker": {"ip": c["WORKER_IP"], "host": c["WORKER_SSH_HOST"]},
         },
         "config": {k: cfg().get(k, "") for k in CONFIG_FIELDS},
+        "serving_mode": {
+            "current": "single" if cur_tp <= 1 else "cluster",
+            "recommended": recommended,
+            "fit": fit,
+        },
     }
 
 
@@ -676,14 +693,25 @@ def download_status() -> dict:
 
 
 def _start_vllm(model: str, max_len_override: int = None) -> tuple:
-    """Relaunch vLLM serve in the running container with the given model."""
+    """Relaunch vLLM serve in the running container with the given model.
+
+    Tensor parallel selects the execution backend: TP>=2 shards the model
+    across both GB10s via Ray, while TP=1 runs single-node on the head GPU
+    with the multiprocessing backend (no Ray). Single-node is faster to start
+    and avoids Ray scheduling the lone shard onto the worker box.
+    """
     c = cfg()
     max_len = max_len_override if max_len_override else c["MAX_MODEL_LEN"]
+    try:
+        tp = int(c.get("TENSOR_PARALLEL", "2") or 2)
+    except ValueError:
+        tp = 2
+    backend = "ray" if tp > 1 else "mp"
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
         f"vllm serve '{model}' --host 0.0.0.0 --port {c['API_PORT']} "
-        f"--tensor-parallel-size {c['TENSOR_PARALLEL']} --distributed-executor-backend ray "
+        f"--tensor-parallel-size {tp} --distributed-executor-backend {backend} "
         f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {max_len} "
         f"> /var/log/vllm.log 2>&1"
     )
@@ -890,6 +918,30 @@ def swap_model(model: str):
         return {"ok": True, "detail": f"Loading cached {model}..."}
     threading.Thread(target=_download_worker, args=(model, True), daemon=True).start()
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
+
+
+def set_serving_mode(mode: str) -> dict:
+    """Switch between single-node (TP=1, mp backend) and two-node (TP=2, ray).
+
+    Persists TENSOR_PARALLEL, then — if a model is currently serving — reloads
+    it under the new mode (with the usual rollback on failure). If nothing is
+    serving, the change just applies on the next load/start.
+    """
+    tp = 1 if mode == "single" else 2
+    label = "single node" if mode == "single" else "both nodes (TP=2)"
+    write_env_value(CLUSTER_ENV, "TENSOR_PARALLEL", str(tp))
+    log_line(f"[mode] serving mode -> {label}")
+    serving = currently_serving()
+    if not serving:
+        return {"ok": True, "tp": tp, "reloaded": False,
+                "detail": f"Set to {label}. Applies when you next load or start a model."}
+    with _download_lock:
+        if _download["active"]:
+            return {"ok": False, "tp": tp,
+                    "detail": f"Busy: {_download['model']} ({_download['status']}). Try again when it finishes."}
+    threading.Thread(target=_load_worker, args=(serving,), daemon=True).start()
+    return {"ok": True, "tp": tp, "reloaded": True,
+            "detail": f"Switching to {label} and reloading {serving}…"}
 
 
 def preload_check(model: str) -> dict:
@@ -1352,6 +1404,14 @@ def api_preload_check(payload: dict = Body(...)):
 @app.post("/api/model/unload")
 def api_model_unload():
     return JSONResponse(unload_model())
+
+
+@app.post("/api/serving-mode")
+def api_serving_mode(payload: dict = Body(...)):
+    mode = (payload.get("mode") or "").strip()
+    if mode not in ("single", "cluster"):
+        return JSONResponse({"ok": False, "detail": "mode must be 'single' or 'cluster'"}, status_code=400)
+    return JSONResponse(set_serving_mode(mode))
 
 
 @app.post("/api/download")

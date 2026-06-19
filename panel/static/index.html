@@ -280,6 +280,12 @@
   details.advanced .chev { margin-left: auto; color: var(--dim); transition: transform .15s; }
   details.advanced[open] .chev { transform: rotate(90deg); }
   details.advanced .adv-body { margin-top: 16px; }
+
+  /* serving-mode segmented control (single node vs both nodes) */
+  .seg { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .segbtn { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  .segbtn:hover { border-color: var(--dim); }
+  .segbtn.active { color: var(--fabric); border-color: var(--fabric-dim); background: #0e1a18; }
 </style>
 </head>
 <body>
@@ -417,6 +423,14 @@
       <div class="field">
         <label for="f-model">Model</label>
         <input id="f-model" type="text" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>Serving mode</label>
+        <div class="seg" role="group" aria-label="Serving mode">
+          <button type="button" class="segbtn" id="mode-single" data-mode="single" aria-pressed="false">Single node</button>
+          <button type="button" class="segbtn" id="mode-cluster" data-mode="cluster" aria-pressed="false">Both nodes · TP=2</button>
+        </div>
+        <p class="hint" id="mode-hint">Single serves from the head GPU only (best for models that fit one box); Both shards across the pair.</p>
       </div>
       <div class="row2">
         <div class="field">
@@ -620,12 +634,37 @@ const renderStatus = (s) => {
     $("f-len").value = s.config.MAX_MODEL_LEN || "";
     configLoaded = true;
   }
+
+  renderServingMode(s.serving_mode);
 };
 
 const pollStatus = async () => {
   try { renderStatus(await api("/api/status")); }
   catch (e) { $("verdict-text").textContent = "Panel cannot reach the backend."; }
 };
+
+// ---------- serving mode: single node (TP=1) vs both nodes (TP=2) ----------
+const renderServingMode = (sm) => {
+  if (!sm) return;
+  const cur = sm.current;
+  $("mode-single").classList.toggle("active", cur === "single");
+  $("mode-single").setAttribute("aria-pressed", cur === "single" ? "true" : "false");
+  $("mode-cluster").classList.toggle("active", cur === "cluster");
+  $("mode-cluster").setAttribute("aria-pressed", cur === "cluster" ? "true" : "false");
+  let hint;
+  if (sm.recommended === "single") hint = "Recommended: Single node — this model fits one GB10 (faster per token, leaves the other box free).";
+  else if (sm.recommended === "cluster") hint = "Recommended: Both nodes — this model needs the pooled memory of both GB10s.";
+  else hint = "Single serves from the head GPU only (best for models that fit one box); Both shards across the pair (TP=2).";
+  $("mode-hint").textContent = hint;
+};
+const setServingMode = (mode, btn) => withBusy(btn, mode === "single" ? "Single…" : "Both…", async () => {
+  const r = await api("/api/serving-mode", "POST", { mode });
+  toast(r.detail, rtype(r));
+  if (r.tp) $("f-tp").value = r.tp;
+  pollStatus(); pollDownload();
+});
+$("mode-single").onclick = (e) => setServingMode("single", e.currentTarget);
+$("mode-cluster").onclick = (e) => setServingMode("cluster", e.currentTarget);
 
 // console can show either the activity feed or live vLLM logs.
 // pollActivity must not clobber the vLLM view, and the vLLM view should refresh itself.
