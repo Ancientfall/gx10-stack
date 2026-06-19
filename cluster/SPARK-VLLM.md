@@ -14,12 +14,18 @@ control surface. The native `02-launch-cluster.sh` kit stays as a fallback.
 > build), so they have not been validated from CI. Treat the first run as a
 > bring-up and keep the native `gx10/vllm-ray` image as a known-good fallback.
 
+> **Fastest path:** `./deploy.sh --engine spark` from the repo root does all of
+> the below (submodule, build, launch, panel wiring). The steps here are the
+> manual equivalent / reference.
+
 ## 1. Get it on both nodes
 
+It's vendored as a git submodule at `cluster/spark-vllm-docker`. If you cloned
+gx10-stack with `--recurse-submodules` it's already there; otherwise:
+
 ```bash
-# on the head (myspark) and worker (myspark2)
-git clone https://github.com/eugr/spark-vllm-docker.git
-cd spark-vllm-docker
+git submodule update --init --recursive
+cd cluster/spark-vllm-docker
 ```
 
 Passwordless SSH head→worker is already set up by `01-node-setup.sh`.
@@ -74,19 +80,20 @@ Recipes and mods (the broad-model conveniences) live here too:
 
 ## 5. Point the GX10 panel at it
 
-The panel is orchestrator-agnostic. Set four environment variables so Start/Stop
-and `docker exec` target eugr instead of the native kit. Add them to the systemd
-unit (`sudo systemctl edit gx10-panel`) as a drop-in:
+The panel is orchestrator-agnostic. `deploy.sh --engine spark` and
+`panel/install.sh --engine spark` wire this up automatically by writing
+`panel/panel.env` (loaded by the systemd unit):
 
-```ini
-[Service]
-Environment=GX10_CONTAINER=vllm_node
-Environment=GX10_ORCH_DIR=%h/spark-vllm-docker
-Environment=GX10_START_CMD=./launch-cluster.sh start
-Environment=GX10_STOP_CMD=./launch-cluster.sh stop
+```
+GX10_CONTAINER=vllm_node
+GX10_ORCH_DIR=<repo>/cluster/spark-vllm-docker
+GX10_START_CMD=./launch-cluster.sh start     # or '--solo start' for single node
+GX10_STOP_CMD=./launch-cluster.sh stop
 ```
 
-Then `sudo systemctl restart gx10-panel`. With these set:
+To convert an existing native install: `panel/install.sh --engine spark`
+(add `--nodes single` for solo), then `sudo systemctl restart gx10-panel`.
+With these set:
 
 - **Start / Stop** run eugr's `launch-cluster.sh` (in `GX10_ORCH_DIR`) and stream
   its output into the activity log.

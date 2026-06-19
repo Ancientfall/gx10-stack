@@ -1,0 +1,5 @@
+[submodule "cluster/spark-vllm-docker"]
+	path = cluster/spark-vllm-docker
+	url = https://github.com/eugr/spark-vllm-docker.git
+	branch = main
+	shallow = true

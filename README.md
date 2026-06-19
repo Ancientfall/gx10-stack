@@ -21,6 +21,20 @@ charts, and an optional vLLM image/version manager. See `panel/README.md`.
 
 ## Quickstart
 
+### Easiest: one command (from the head node)
+
+```bash
+git clone --recurse-submodules https://github.com/Ancientfall/gx10-stack.git
+cd gx10-stack
+./deploy.sh        # guided: config, SSH, node setup, build, launch, panel
+```
+
+Pick **native** (NVIDIA NGC image) or **spark** (`eugr/spark-vllm-docker`, broadest
+model coverage) when prompted, and single- vs two-node. It's idempotent — re-run
+any time. Non-interactive: `./deploy.sh -y --engine spark --nodes cluster`.
+
+### Manual steps
+
 On each GX10, once the repo is cloned:
 
 ```bash
