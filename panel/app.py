@@ -677,19 +677,58 @@ def _start_vllm(model: str) -> tuple:
     return run(["docker", "exec", "-d", CONTAINER, "bash", "-c", serve], timeout=15)
 
 
+def _watch_vllm_until_ready(model: str, timeout_s: int = 1200):
+    """Poll the vLLM log + API to report load phases until the model serves or fails."""
+    c = cfg()
+    port = c["API_PORT"]
+    start = time.time()
+    phase = "loading"
+    while time.time() - start < timeout_s:
+        # is the API serving this model yet?
+        rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{port}/v1/models"], timeout=5)
+        if rc == 0 and out:
+            try:
+                served = json.loads(out)["data"][0]["id"]
+                if served == model:
+                    _set_dl(active=False, status="ready", percent=100,
+                            detail=f"{model} is live and serving.", error=None)
+                    log_line(f"[model] {model} is ready and serving")
+                    return
+            except Exception:
+                pass
+        # read the tail to report which phase we're in
+        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "8", "/var/log/vllm.log"], timeout=8)
+        if rc2 == 0 and log:
+            low = log.lower()
+            if "error" in low or "traceback" in low or "exited" in low:
+                # capture a concise error line
+                errline = next((l for l in log.splitlines()[::-1] if "error" in l.lower()), "Load error")
+                _set_dl(active=False, status="error", error=errline[:160], detail=errline[:160])
+                log_line(f"[model] load error: {errline[:160]}")
+                return
+            if "capturing" in low or "graph" in low or "compile" in low:
+                phase = "compiling"
+            elif "loading safetensors" in low or "loading weights" in low or "loading model" in low:
+                phase = "loading weights"
+            elif "download" in low:
+                phase = "downloading weights"
+        elapsed = int(time.time() - start)
+        _set_dl(active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
+        time.sleep(5)
+    _set_dl(active=False, status="error", error="Timed out waiting for the model to load.",
+            detail="Load timed out. Check the activity log / vLLM logs.")
+
+
 def _download_worker(model: str, auto_load: bool):
-    """Download weights into the cache with progress, then optionally load."""
+    """Download weights into the cache with progress, then optionally load + watch."""
     c = cfg()
     token = c.get("HF_TOKEN", "")
     _set_dl(active=True, model=model, status="downloading", percent=0,
-            detail="Starting download...", speed="", error=None, started=time.time())
+            detail=f"Preparing to download {model}...", speed="", error=None, started=time.time())
     log_line(f"[download] starting {model}")
 
-    # huggingface-cli runs inside the container, writing to the mounted cache.
-    # --quiet off so we can parse progress. Token passed via env if present.
     env_prefix = f"HF_TOKEN={token} " if token else ""
-    cmd = (f"{env_prefix}huggingface-cli download '{model}' "
-           f"--exclude '*.pth' '*.bin.index.json.*' 2>&1")
+    cmd = f"{env_prefix}hf download '{model}' 2>&1"
 
     proc = subprocess.Popen(
         ["docker", "exec", CONTAINER, "bash", "-lc", cmd],
@@ -703,11 +742,10 @@ def _download_worker(model: str, auto_load: bool):
         line = line.strip()
         if not line:
             continue
-        # surface gated/auth and not-found errors clearly
         low = line.lower()
-        if "401" in line or "gated" in low or "awaiting a review" in low or "restricted" in low:
+        if "401" in line or "gated" in low or "awaiting a review" in low or "restricted" in low or "authentication" in low:
             saw_error = "Model is gated. Set HF_TOKEN in cluster.env and request access on Hugging Face."
-        elif "404" in line or "repository not found" in low:
+        elif "404" in line or "repository not found" in low or "not found" in low:
             saw_error = "Model not found. Check the exact repo id."
         elif "no space left" in low:
             saw_error = "Out of disk space in the cache volume."
@@ -717,7 +755,8 @@ def _download_worker(model: str, auto_load: bool):
             if pct >= last_pct:
                 last_pct = pct
                 sp = pat_speed.search(line)
-                _set_dl(percent=pct, detail=f"Downloading {model}", speed=sp.group(1) if sp else "")
+                _set_dl(percent=pct, status="downloading",
+                        detail=f"Downloading {model}", speed=sp.group(1) if sp else "")
     proc.wait()
 
     if saw_error or proc.returncode != 0:
@@ -730,38 +769,69 @@ def _download_worker(model: str, auto_load: bool):
     log_line(f"[download] complete {model}")
 
     if auto_load:
-        _set_dl(status="loading", detail=f"Loading {model} into the cluster...")
-        log_line(f"[download] auto-loading {model}")
         write_env_value(CLUSTER_ENV, "MODEL", model)
+        _set_dl(active=True, status="loading", detail=f"Starting {model} on the cluster...")
+        log_line(f"[model] auto-loading {model}")
         rc, _, err = _start_vllm(model)
         if rc != 0:
             _set_dl(active=False, status="error", error=f"Load failed: {err}")
             return
-        _set_dl(active=False, status="loaded", detail=f"{model} loading. Ready in a few minutes.")
+        _watch_vllm_until_ready(model)
     else:
-        _set_dl(active=False)
+        _set_dl(active=False, status="downloaded")
+
+
+def _load_worker(model: str):
+    """Load an already-cached model and watch it through to ready."""
+    write_env_value(CLUSTER_ENV, "MODEL", model)
+    _set_dl(active=True, model=model, status="loading", percent=0,
+            detail=f"Starting {model}...", speed="", error=None, started=time.time())
+    log_line(f"[model] loading cached {model}")
+    rc, _, err = _start_vllm(model)
+    if rc != 0:
+        _set_dl(active=False, status="error", error=f"Relaunch failed: {err}. Is the cluster running?")
+        return
+    _watch_vllm_until_ready(model)
 
 
 def start_download(model: str, auto_load: bool = True):
     with _download_lock:
         if _download["active"]:
-            return {"ok": False, "detail": f"A download is already running: {_download['model']}"}
+            return {"ok": False, "detail": f"A job is already running: {_download['model']}"}
     threading.Thread(target=_download_worker, args=(model, auto_load), daemon=True).start()
     return {"ok": True, "detail": f"Download started for {model}."}
 
 
 def swap_model(model: str):
-    """If already cached, load immediately; otherwise kick off a tracked download then load."""
+    """Cached -> load + watch. Not cached -> download + auto-load + watch."""
+    with _download_lock:
+        if _download["active"]:
+            return {"ok": False, "detail": f"Busy: {_download['model']} ({_download['status']})"}
     cached = {m["id"] for m in hf_cache_models()}
     if model in cached:
-        write_env_value(CLUSTER_ENV, "MODEL", model)
-        log_line(f"[model] switching to cached {model}")
-        rc, _, err = _start_vllm(model)
-        if rc != 0:
-            return {"ok": False, "detail": f"Relaunch failed: {err}. Is the cluster running?"}
-        return {"ok": True, "detail": f"Loading cached {model}. Ready in a few minutes."}
-    # not cached: download with progress, then auto-load
-    return start_download(model, auto_load=True)
+        threading.Thread(target=_load_worker, args=(model,), daemon=True).start()
+        return {"ok": True, "detail": f"Loading cached {model}..."}
+    threading.Thread(target=_download_worker, args=(model, True), daemon=True).start()
+    return {"ok": True, "detail": f"Downloading then loading {model}..."}
+
+
+def unload_model():
+    """Stop vLLM serving (frees memory). Cluster/Ray stays up."""
+    with _download_lock:
+        if _download["active"]:
+            return {"ok": False, "detail": "A job is running; wait for it to finish first."}
+    rc, _, _ = run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
+    _set_dl(active=False, status="idle", model=None, percent=0, detail="", error=None)
+    log_line("[model] unloaded (vLLM serve stopped)")
+    return {"ok": True, "detail": "Model unloaded. Memory freed. Load one to resume serving."}
+
+
+def dismiss_status():
+    """Clear a finished/errored job banner."""
+    with _download_lock:
+        if not _download["active"]:
+            _download.update(status="idle", model=None, percent=0, detail="", error=None)
+    return {"ok": True}
 
 
 def vllm_logs(lines=120):
@@ -1008,6 +1078,16 @@ def api_models_test(payload: dict = Body(...)):
 @app.get("/api/download/status")
 def api_download_status():
     return JSONResponse(download_status())
+
+
+@app.post("/api/download/dismiss")
+def api_download_dismiss():
+    return JSONResponse(dismiss_status())
+
+
+@app.post("/api/model/unload")
+def api_model_unload():
+    return JSONResponse(unload_model())
 
 
 @app.post("/api/download")
