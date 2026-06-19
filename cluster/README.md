@@ -75,14 +75,15 @@ To wipe the cluster software back to a clean slate **without reinstalling the OS
 
 ```bash
 ./reset.sh                    # this node (shows a plan, asks before deleting)
-./reset.sh -c                 # also reset the worker over SSH
+./reset.sh -c --volumes       # full nuke on both nodes, incl. unreferenced volumes
 ./reset.sh -y --keep-models   # no prompt, but keep downloaded models
 ```
 
 It removes the containers, the panel (service, sudoers drop-in, venv, `panel.env`,
 metrics db), the config/netplan/sysctl/limits files node-setup wrote, a nested
 duplicate clone, all vLLM images + build cache, and — unless `--keep-models` — the
-HF model cache and spark build caches. Reboot afterwards, then `./deploy.sh`.
+HF model cache and spark build caches. Add `--volumes` to also prune unreferenced
+Docker volumes. Reboot afterwards, then `./deploy.sh`.
 
 ## Hardware reality check
 

@@ -10,6 +10,7 @@
 #   ./reset.sh -y              # no prompt
 #   ./reset.sh --keep-models   # keep the HF model cache (skip the big re-download)
 #   ./reset.sh --keep-images   # keep docker images
+#   ./reset.sh --volumes       # also prune unreferenced docker volumes
 #   ./reset.sh -c              # also reset the worker over SSH
 # ============================================================
 set -uo pipefail
@@ -25,14 +26,15 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-/data/hf-cache}"
 CLUSTER_USER="${CLUSTER_USER:-$USER}"
 WORKER_SSH_HOST="${WORKER_SSH_HOST:-}"
 
-KEEP_MODELS=0; KEEP_IMAGES=0; YES=0; WORKER=0
+KEEP_MODELS=0; KEEP_IMAGES=0; PRUNE_VOLUMES=0; YES=0; WORKER=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --keep-models) KEEP_MODELS=1; shift;;
         --keep-images) KEEP_IMAGES=1; shift;;
+        --volumes)     PRUNE_VOLUMES=1; shift;;
         -y|--yes)      YES=1; shift;;
         -c|--worker|--all-nodes) WORKER=1; shift;;
-        -h|--help)     sed -n '2,16p' "$0"; exit 0;;
+        -h|--help)     sed -n '2,17p' "$0"; exit 0;;
         *)             echo "Unknown argument: $1"; exit 1;;
     esac
 done
@@ -53,6 +55,7 @@ plan() {
     echo "           /etc/sysctl.d/90-gx10-cluster.conf, /etc/security/limits.d/90-gx10-memlock.conf"
     [[ "${KEEP_IMAGES}" == 1 ]] && echo "  - images: KEPT" || echo "  - ALL vLLM images + docker build cache"
     [[ "${KEEP_MODELS}" == 1 ]] && echo "  - model cache: KEPT" || echo "  - model cache: ${HF_CACHE_DIR} + spark caches (DELETED)"
+    [[ "${PRUNE_VOLUMES}" == 1 ]] && echo "  - docker volumes: unreferenced volumes pruned"
     [[ "${WORKER}" == 1 ]] && echo "  - and the same on worker ${WORKER_SSH_HOST:-<unset>}"
 }
 
@@ -84,6 +87,11 @@ wipe_local() {
         ${SUDO} docker builder prune -af 2>/dev/null || true
     fi
 
+    if [[ "${PRUNE_VOLUMES}" == 1 ]]; then
+        say "Docker volumes (unreferenced)"
+        ${SUDO} docker volume prune -f 2>/dev/null || true
+    fi
+
     if [[ "${KEEP_MODELS}" != 1 ]]; then
         say "Model + build caches"
         ${SUDO} rm -rf "${HF_CACHE_DIR:?}" 2>/dev/null || true
@@ -110,6 +118,9 @@ if [ "${KEEP_IMAGES}" != "1" ]; then
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E 'vllm|vllm-ray|vllm-node' | xargs -r docker rmi -f 2>/dev/null || true
   docker image prune -af 2>/dev/null || true
   docker builder prune -af 2>/dev/null || true
+fi
+if [ "${PRUNE_VOLUMES}" = "1" ]; then
+  docker volume prune -f 2>/dev/null || true
 fi
 if [ "${KEEP_MODELS}" != "1" ]; then
   rm -rf "${HF_CACHE_DIR:?}" 2>/dev/null || true
