@@ -13,6 +13,25 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PANEL_USER="${SUDO_USER:-$USER}"
 
+# ------------------------------------------------------------
+# Options
+#   --engine native|spark   native = 02-launch-cluster.sh; spark = eugr/spark-vllm-docker
+#   --orch-dir DIR          where spark-vllm-docker lives (default: <kit>/spark-vllm-docker)
+#   --nodes single|cluster  single uses eugr's --solo start
+#   --port N                panel port (default 8080)
+# ------------------------------------------------------------
+ENGINE="native"; ORCH_DIR=""; NODES=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --engine)   ENGINE="$2"; shift 2;;
+        --orch-dir) ORCH_DIR="$2"; shift 2;;
+        --nodes)    NODES="$2"; shift 2;;
+        --port)     export GX10_PANEL_PORT="$2"; shift 2;;
+        -h|--help)  echo "Usage: ./install.sh [--engine native|spark] [--orch-dir DIR] [--nodes single|cluster] [--port N]"; exit 0;;
+        *)          echo "Unknown argument: $1"; exit 1;;
+    esac
+done
+
 # Locate the cluster kit (cluster.env)
 KIT_DIR="${GX10_KIT_DIR:-}"
 if [[ -z "${KIT_DIR}" ]]; then
@@ -30,6 +49,28 @@ if [[ ! -f "${KIT_DIR}/cluster.env" && -f "${KIT_DIR}/cluster.env.example" ]]; t
 fi
 
 log() { echo -e "\n\033[1;32m==> $*\033[0m"; }
+
+# ------------------------------------------------------------
+# 0. Engine env (panel.env): native = defaults; spark = drive eugr/spark-vllm-docker
+# ------------------------------------------------------------
+PANEL_ENV="${DIR}/panel.env"
+if [[ "${ENGINE}" == "spark" ]]; then
+    ORCH_DIR="${ORCH_DIR:-${KIT_DIR}/spark-vllm-docker}"
+    if [[ "${NODES}" == "single" ]]; then START_CMD="./launch-cluster.sh --solo start"; else START_CMD="./launch-cluster.sh start"; fi
+    cat > "${PANEL_ENV}" <<EOF
+# Written by install.sh --engine spark. Drives eugr/spark-vllm-docker.
+GX10_CONTAINER=vllm_node
+GX10_ORCH_DIR=${ORCH_DIR}
+GX10_START_CMD=${START_CMD}
+GX10_STOP_CMD=./launch-cluster.sh stop
+EOF
+    log "Engine: spark-vllm-docker (orchestrator dir: ${ORCH_DIR})"
+else
+    cat > "${PANEL_ENV}" <<EOF
+# Native engine (02-launch-cluster.sh). No orchestrator overrides.
+EOF
+    log "Engine: native (gx10/vllm-ray)"
+fi
 
 # ------------------------------------------------------------
 # 1. Python venv + deps
@@ -86,6 +127,7 @@ sudo systemctl --no-pager --lines=0 status gx10-panel.service || true
 log "Done"
 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
 echo "Kit dir:  ${KIT_DIR}"
+echo "Engine:   ${ENGINE}  (env file: ${PANEL_ENV})"
 echo "Local:    http://localhost:${PANEL_PORT}"
 if [[ -n "${TS_IP}" ]]; then
     echo "Tailscale: http://${TS_IP}:${PANEL_PORT}  (reachable from your Mac/phone)"

@@ -15,6 +15,7 @@ import glob
 import time
 import json
 import shlex
+import socket
 import sqlite3
 import threading
 import subprocess
@@ -54,8 +55,17 @@ def _resolve_kit_dir() -> Path:
 KIT_DIR = _resolve_kit_dir()
 CLUSTER_ENV = KIT_DIR / "cluster.env"
 NODE_CONF = Path("/etc/gx10-cluster.conf")
-CONTAINER = "vllm-node"
+# Container the panel exec's into for serve/logs/metrics. Our native kit names it
+# "vllm-node"; eugr/spark-vllm-docker names it "vllm_node". Override accordingly.
+CONTAINER = os.environ.get("GX10_CONTAINER", "vllm-node")
 LAUNCH_SCRIPT = KIT_DIR / "02-launch-cluster.sh"
+
+# Optional external orchestrator (e.g. eugr/spark-vllm-docker). When GX10_START_CMD
+# / GX10_STOP_CMD are set, Start/Stop run those shell commands in GX10_ORCH_DIR
+# instead of the native launch script. Unset = native behaviour (unchanged).
+ORCH_DIR = Path(os.environ.get("GX10_ORCH_DIR", str(KIT_DIR)))
+START_CMD = os.environ.get("GX10_START_CMD")
+STOP_CMD = os.environ.get("GX10_STOP_CMD")
 
 PANEL_HOST = os.environ.get("GX10_PANEL_HOST", "0.0.0.0")
 PANEL_PORT = int(os.environ.get("GX10_PANEL_PORT", "8080"))
@@ -117,6 +127,7 @@ def cfg() -> dict:
         "VLLM_IMAGE": "nvcr.io/nvidia/vllm:26.01-py3",
         "HF_TOKEN": "",
         "CX7_IFACE": "enp1s0f1np1",
+        "HF_CACHE_DIR": "/data/hf-cache",
     }
     data.update(read_env(CLUSTER_ENV))
     data.update(read_env(NODE_CONF))
@@ -196,17 +207,28 @@ def db_history(since_seconds: int, max_points: int = 240):
 
 
 def db_cost_summary():
-    """Tokens generated and cost-equivalent over windows."""
+    """Tokens generated and cost-equivalent over windows.
+
+    vLLM's generation_tokens_total is cumulative since the engine started and
+    resets to 0 whenever the model is reloaded. A plain MAX-MIN would drop an
+    entire segment after any restart (and can read as 0 across a reset), so sum
+    the positive deltas between consecutive samples instead; a reset shows up as
+    a negative delta we simply skip.
+    """
     now = int(time.time())
     out = {"rate_per_mtok": COST_PER_MTOK}
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         for label, secs in (("today", 86400), ("week", 604800), ("all", 10**12)):
             cutoff = now - secs
-            r = con.execute(
-                "SELECT MIN(gen_total), MAX(gen_total) FROM samples WHERE ts >= ? AND gen_total IS NOT NULL",
-                (cutoff,)).fetchone()
-            lo, hi = r if r else (None, None)
-            tokens = (hi - lo) if (lo is not None and hi is not None and hi >= lo) else 0
+            rows = con.execute(
+                "SELECT gen_total FROM samples WHERE ts >= ? AND gen_total IS NOT NULL ORDER BY ts",
+                (cutoff,)).fetchall()
+            tokens = 0.0
+            prev = None
+            for (g,) in rows:
+                if prev is not None and g > prev:
+                    tokens += g - prev
+                prev = g
             out[label] = {
                 "tokens": int(tokens),
                 "cost_equiv": round(tokens / 1_000_000 * COST_PER_MTOK, 2),
@@ -506,16 +528,33 @@ def gather_status() -> dict:
     else:
         overall = "ok"
     running = api_ok or ray_ok
+
+    # recommend single vs two-node serving from the current model's memory fit
+    model = c.get("MODEL", "")
+    params = next((m["params_b"] for m in CURATED_MODELS if m["id"] == model), None) \
+        or _guess_params_from_name(model)
+    fit = _fit_label(params)["fit"] if params else "unknown"
+    recommended = "single" if fit == "single" else ("cluster" if fit in ("cluster", "toobig") else "")
+    try:
+        cur_tp = int(c.get("TENSOR_PARALLEL", "2") or 2)
+    except ValueError:
+        cur_tp = 2
+
     return {
         "overall": overall,
         "running": running,
         "action": _current_action["name"],
         "checks": checks,
         "nodes": {
-            "head": {"ip": c["HEAD_IP"], "iface": c.get("CX7_IFACE", "")},
+            "head": {"ip": c["HEAD_IP"], "iface": c.get("CX7_IFACE", ""), "host": socket.gethostname()},
             "worker": {"ip": c["WORKER_IP"], "host": c["WORKER_SSH_HOST"]},
         },
         "config": {k: cfg().get(k, "") for k in CONFIG_FIELDS},
+        "serving_mode": {
+            "current": "single" if cur_tp <= 1 else "cluster",
+            "recommended": recommended,
+            "fit": fit,
+        },
     }
 
 
@@ -549,7 +588,6 @@ def optimize() -> list:
         record("Netplan conflict", "ok", "No conflict.")
 
     # 2. MTU 9000 on the CX7 interface
-    _, mtu = _iface_speed_mtu(iface)[1], None
     _, mtu = _iface_speed_mtu(iface)
     if mtu != "9000":
         rc, _, err = _sudo(["ip", "link", "set", iface, "mtu", "9000"])
@@ -612,13 +650,19 @@ def _run_launch(arg=None):
     with _action_lock:
         _current_action["name"] = name
         try:
-            if not LAUNCH_SCRIPT.exists():
-                log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
-                         f"Set GX10_KIT_DIR.")
-                return
-            cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
+            custom = STOP_CMD if arg == "stop" else START_CMD
+            if custom:
+                cmd = ["bash", "-lc", custom]
+                cwd = str(ORCH_DIR)
+            else:
+                if not LAUNCH_SCRIPT.exists():
+                    log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
+                             f"Set GX10_KIT_DIR (or GX10_START_CMD for an external orchestrator).")
+                    return
+                cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
+                cwd = str(KIT_DIR)
             log_line(f"[{name}] {' '.join(cmd)}")
-            proc = subprocess.Popen(cmd, cwd=str(KIT_DIR), text=True,
+            proc = subprocess.Popen(cmd, cwd=cwd, text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             for line in proc.stdout:
                 if line.strip():
@@ -664,14 +708,25 @@ def download_status() -> dict:
 
 
 def _start_vllm(model: str, max_len_override: int = None) -> tuple:
-    """Relaunch vLLM serve in the running container with the given model."""
+    """Relaunch vLLM serve in the running container with the given model.
+
+    Tensor parallel selects the execution backend: TP>=2 shards the model
+    across both GB10s via Ray, while TP=1 runs single-node on the head GPU
+    with the multiprocessing backend (no Ray). Single-node is faster to start
+    and avoids Ray scheduling the lone shard onto the worker box.
+    """
     c = cfg()
     max_len = max_len_override if max_len_override else c["MAX_MODEL_LEN"]
+    try:
+        tp = int(c.get("TENSOR_PARALLEL", "2") or 2)
+    except ValueError:
+        tp = 2
+    backend = "ray" if tp > 1 else "mp"
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
         f"vllm serve '{model}' --host 0.0.0.0 --port {c['API_PORT']} "
-        f"--tensor-parallel-size {c['TENSOR_PARALLEL']} --distributed-executor-backend ray "
+        f"--tensor-parallel-size {tp} --distributed-executor-backend {backend} "
         f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {max_len} "
         f"> /var/log/vllm.log 2>&1"
     )
@@ -701,48 +756,78 @@ def _explain_error(log: str) -> str:
     return "Engine failed to start. See vLLM logs for details."
 
 
+def _model_matches(served: str, requested: str) -> bool:
+    """True if vLLM's served id is the model we asked for (tolerating path vs repo-id)."""
+    if not served or not requested:
+        return False
+    s, r = served.strip().lower(), requested.strip().lower()
+    return s == r or s.rsplit("/", 1)[-1] == r.rsplit("/", 1)[-1]
+
+
+def _vllm_dead() -> bool:
+    """True only when we're sure no vllm serve process is running.
+
+    pgrep exit codes: 0 = a process matched, 1 = none matched, anything else
+    (2/3 usage, 126/127 missing) = unknown. Only rc==1 is a confident "dead";
+    on unknown we assume alive so a missing pgrep can't cause a false failure.
+    """
+    rc, _, _ = run(["docker", "exec", CONTAINER, "pgrep", "-f", "vllm serve"], timeout=8)
+    return rc == 1
+
+
 def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -> bool:
-    """Poll until the model serves (return True) or fails (return False)."""
+    """Poll until the model serves (True) or the engine dies / times out (False).
+
+    Success is the API serving the requested model. Failure is declared only
+    when the vllm serve process has actually exited - non-fatal tracebacks in
+    the log (kernel fallbacks, quantization warnings) are common during load,
+    especially for newer formats like NVFP4, and must not be mistaken for a
+    crash or a model that loads fine gets reported as failed.
+    """
     c = cfg()
     port = c["API_PORT"]
     start = time.time()
     phase = "loading"
     while time.time() - start < timeout_s:
+        # 1) success: API is serving our model
         rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{port}/v1/models"], timeout=5)
         if rc == 0 and out:
             try:
                 served = json.loads(out)["data"][0]["id"]
-                if served == model:
+                if _model_matches(served, model):
                     _set_dl(active=False, status="ready", percent=100,
                             detail=f"{model} is live and serving.", error=None)
                     log_line(f"[model] {model} is ready and serving")
                     return True
             except Exception:
                 pass
-        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "40", "/var/log/vllm.log"], timeout=8)
-        if rc2 == 0 and log:
-            low = log.lower()
-            # auto-correct context length once
-            mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
-            if mlen and not _retried:
-                real_max = int(mlen.group(1))
-                log_line(f"[model] {model} caps context at {real_max}; retrying")
-                _set_dl(active=True, status="loading",
-                        detail=f"{model} max context is {real_max}, retrying...")
-                _start_vllm(model, max_len_override=real_max)
-                _model_maxlen_cache[model] = real_max
-                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
-            # fatal error?
-            if ("engine core initialization failed" in low or "traceback (most recent call last)" in low
-                    or "raise runtimeerror" in low):
-                reason = _explain_error(log)
-                _set_dl(active=False, status="error", error=reason, detail=reason)
-                log_line(f"[model] load FAILED: {reason}")
-                return False
-            if "capturing" in low or "graph" in low or "compile" in low:
-                phase = "compiling"
-            elif "loading safetensors" in low or "loading weights" in low:
-                phase = "loading weights"
+
+        # 2) read the recent log for phase hints + a one-time context-length fix
+        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "60", "/var/log/vllm.log"], timeout=8)
+        log = log if (rc2 == 0 and log) else ""
+        low = log.lower()
+        mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
+        if mlen and not _retried:
+            real_max = int(mlen.group(1))
+            log_line(f"[model] {model} caps context at {real_max}; retrying")
+            _set_dl(active=True, status="loading",
+                    detail=f"{model} max context is {real_max}, retrying...")
+            _start_vllm(model, max_len_override=real_max)
+            _model_maxlen_cache[model] = real_max
+            return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
+
+        # 3) failure: only when the engine process has actually exited. Grace the
+        #    first 25s so the pkill->relaunch gap and slow startup don't trip it.
+        if (time.time() - start) > 25 and _vllm_dead():
+            reason = _explain_error(log) if log else "Engine exited during startup. See vLLM logs."
+            _set_dl(active=False, status="error", error=reason, detail=reason)
+            log_line(f"[model] load FAILED: {reason}")
+            return False
+
+        if "capturing" in low or "graph" in low or "compile" in low:
+            phase = "compiling"
+        elif "loading safetensors" in low or "loading weights" in low:
+            phase = "loading weights"
         elapsed = int(time.time() - start)
         _set_dl(active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
         time.sleep(5)
@@ -764,7 +849,10 @@ def _download_worker(model: str, auto_load: bool):
     log_line(f"[download] starting {model}")
 
     env_prefix = f"HF_TOKEN={token} " if token else ""
-    cmd = f"{env_prefix}hf download '{model}' 2>&1"
+    # `hf` is the current HuggingFace CLI; fall back to the legacy `huggingface-cli`
+    # for images (like eugr/spark-vllm-docker) that only ship the older entrypoint.
+    dl = f"command -v hf >/dev/null 2>&1 && hf download '{model}' || huggingface-cli download '{model}'"
+    cmd = f"{env_prefix}{dl} 2>&1"
 
     proc = subprocess.Popen(
         ["docker", "exec", CONTAINER, "bash", "-lc", cmd],
@@ -878,6 +966,71 @@ def swap_model(model: str):
         return {"ok": True, "detail": f"Loading cached {model}..."}
     threading.Thread(target=_download_worker, args=(model, True), daemon=True).start()
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
+
+
+def _ray_gpu_count() -> int:
+    """How many GPUs are currently registered with the running Ray cluster."""
+    py = ("import ray;ray.init(address='auto',logging_level='ERROR');"
+          "print(int(ray.cluster_resources().get('GPU',0)))")
+    rc, out, _ = run(["docker", "exec", CONTAINER, "python3", "-c", py], timeout=15)
+    if rc != 0:
+        return 0
+    try:
+        return int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _stop_worker_container() -> bool:
+    """Best-effort: remove the vLLM/Ray container on the worker so its GPU idles."""
+    c = cfg()
+    target = f'{c["CLUSTER_USER"]}@{c["WORKER_SSH_HOST"]}'
+    rc, _, _ = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    target, f"docker rm -f {CONTAINER}"], timeout=20)
+    return rc == 0
+
+
+def _apply_mode_reload(model: str, mode: str):
+    """Reload the live model under the new mode; if single, idle the worker after."""
+    _load_worker(model)
+    if mode == "single" and currently_serving() == model and _stop_worker_container():
+        log_line("[mode] worker container stopped - second node idle")
+
+
+def set_serving_mode(mode: str) -> dict:
+    """Switch between single-node (TP=1, mp, worker idle) and two-node (TP=2, ray).
+
+    Persists TENSOR_PARALLEL. If a model is serving, reloads it under the new
+    mode (rollback on failure). Single-node also stops the worker container so
+    the second GX10 idles; switching back to two-node needs a Stop/Start to
+    rebuild the Ray cluster, so we say so rather than attempt a doomed reload.
+    """
+    tp = 1 if mode == "single" else 2
+    label = "single node" if mode == "single" else "both nodes (TP=2)"
+    write_env_value(CLUSTER_ENV, "TENSOR_PARALLEL", str(tp))
+    log_line(f"[mode] serving mode -> {label}")
+    serving = currently_serving()
+
+    # Going back to two-node needs the worker rejoined to Ray; a hot reload
+    # can't do that, so ask for a relaunch when the worker is idle.
+    if mode == "cluster" and serving and _ray_gpu_count() < 2:
+        return {"ok": True, "tp": tp, "reloaded": False,
+                "detail": "Set to both nodes. The worker is idle - Stop then Start to bring it back and shard across both."}
+
+    if not serving:
+        if mode == "single" and _stop_worker_container():
+            log_line("[mode] worker container stopped - second node idle")
+        return {"ok": True, "tp": tp, "reloaded": False,
+                "detail": f"Set to {label}. Applies when you next load or start a model."}
+
+    with _download_lock:
+        if _download["active"]:
+            return {"ok": False, "tp": tp,
+                    "detail": f"Busy: {_download['model']} ({_download['status']}). Try again when it finishes."}
+    threading.Thread(target=_apply_mode_reload, args=(serving, mode), daemon=True).start()
+    extra = " and idling the worker" if mode == "single" else ""
+    return {"ok": True, "tp": tp, "reloaded": True,
+            "detail": f"Switching to {label}{extra} and reloading {serving}…"}
 
 
 def preload_check(model: str) -> dict:
@@ -1340,6 +1493,14 @@ def api_preload_check(payload: dict = Body(...)):
 @app.post("/api/model/unload")
 def api_model_unload():
     return JSONResponse(unload_model())
+
+
+@app.post("/api/serving-mode")
+def api_serving_mode(payload: dict = Body(...)):
+    mode = (payload.get("mode") or "").strip()
+    if mode not in ("single", "cluster"):
+        return JSONResponse({"ok": False, "detail": "mode must be 'single' or 'cluster'"}, status_code=400)
+    return JSONResponse(set_serving_mode(mode))
 
 
 @app.post("/api/download")

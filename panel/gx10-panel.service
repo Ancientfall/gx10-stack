@@ -11,6 +11,9 @@ WorkingDirectory=__DIR__
 Environment=GX10_KIT_DIR=__KIT_DIR__
 Environment=GX10_PANEL_HOST=0.0.0.0
 Environment=GX10_PANEL_PORT=__PANEL_PORT__
+# Optional engine/orchestrator overrides (written by install.sh --engine / deploy.sh).
+# The leading '-' makes it optional, so native installs work with no file present.
+EnvironmentFile=-__DIR__/panel.env
 ExecStart=__DIR__/.venv/bin/python __DIR__/app.py
 Restart=on-failure
 RestartSec=5
