@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>GX10 Cluster Control</title>
+<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20x%3D%221%22%20y%3D%221%22%20width%3D%2230%22%20height%3D%2230%22%20rx%3D%227%22%20fill%3D%22%230d141d%22%20stroke%3D%22%23243040%22/%3E%3Crect%20x%3D%2211%22%20y%3D%2214.6%22%20width%3D%2210%22%20height%3D%222.8%22%20rx%3D%221.4%22%20fill%3D%22%232dd4bf%22/%3E%3Crect%20x%3D%224%22%20y%3D%2210.5%22%20width%3D%228%22%20height%3D%2211%22%20rx%3D%222.4%22%20fill%3D%22%230b1118%22%20stroke%3D%22%232dd4bf%22%20stroke-width%3D%221.8%22/%3E%3Crect%20x%3D%2220%22%20y%3D%2210.5%22%20width%3D%228%22%20height%3D%2211%22%20rx%3D%222.4%22%20fill%3D%22%230b1118%22%20stroke%3D%22%232dd4bf%22%20stroke-width%3D%221.8%22/%3E%3Ccircle%20cx%3D%228%22%20cy%3D%2216%22%20r%3D%221.8%22%20fill%3D%22%232dd4bf%22/%3E%3Ccircle%20cx%3D%2224%22%20cy%3D%2216%22%20r%3D%221.8%22%20fill%3D%22%232dd4bf%22/%3E%3C/svg%3E" />
 <style>
   :root {
     --bg: #090d12;
@@ -522,10 +523,25 @@ const withBusy = async (btn, label, fn) => {
   finally { btn.disabled = wasOff; btn.textContent = prev; }
 };
 
-// reflect cluster health in the browser tab: title text + a coloured favicon dot
+// reflect cluster health in the browser tab: title text + a health-tinted cluster favicon
+// (two nodes joined by the fabric link; the link and node dots take the status colour)
 let _favLink = null;
+const clusterFavicon = (color) =>
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+  '<rect x="1" y="1" width="30" height="30" rx="7" fill="#0d141d" stroke="#243040"/>' +
+  `<rect x="11" y="14.6" width="10" height="2.8" rx="1.4" fill="${color}"/>` +
+  '<rect x="4" y="10.5" width="8" height="11" rx="2.4" fill="#0b1118" stroke="#2dd4bf" stroke-width="1.8"/>' +
+  '<rect x="20" y="10.5" width="8" height="11" rx="2.4" fill="#0b1118" stroke="#2dd4bf" stroke-width="1.8"/>' +
+  `<circle cx="8" cy="16" r="1.8" fill="${color}"/><circle cx="24" cy="16" r="1.8" fill="${color}"/>` +
+  '</svg>';
+const setFavicon = (color) => {
+  const href = "data:image/svg+xml," + encodeURIComponent(clusterFavicon(color));
+  if (!_favLink) _favLink = document.getElementById("favicon");
+  if (!_favLink) { _favLink = document.createElement("link"); _favLink.rel = "icon"; _favLink.id = "favicon"; document.head.appendChild(_favLink); }
+  if (_favLink.getAttribute("href") !== href) _favLink.setAttribute("href", href);
+};
 const setTab = (overall, running, action) => {
-  const color = { ok: "#3fb950", warn: "#d6a032", error: "#f0564b" }[overall] || "#5b6675";
+  const color = { ok: "#3fb950", warn: "#d6a032", error: "#f0564b" }[overall] || "#2dd4bf";
   let title;
   if (action) title = `GX10 · ${action}…`;
   else if (overall === "ok" && running) title = "GX10 · serving";
@@ -534,10 +550,7 @@ const setTab = (overall, running, action) => {
   else if (overall === "error") title = "GX10 · problem";
   else title = "GX10 cluster control";
   if (document.title !== title) document.title = title;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="11" fill="${color}"/></svg>`;
-  const href = "data:image/svg+xml," + encodeURIComponent(svg);
-  if (!_favLink) { _favLink = document.createElement("link"); _favLink.rel = "icon"; document.head.appendChild(_favLink); }
-  if (_favLink.href !== href) _favLink.href = href;
+  setFavicon(color);
 };
 
 const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }[status] || "");
