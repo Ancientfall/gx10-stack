@@ -15,6 +15,7 @@ import glob
 import time
 import json
 import shlex
+import socket
 import sqlite3
 import threading
 import subprocess
@@ -117,6 +118,7 @@ def cfg() -> dict:
         "VLLM_IMAGE": "nvcr.io/nvidia/vllm:26.01-py3",
         "HF_TOKEN": "",
         "CX7_IFACE": "enp1s0f1np1",
+        "HF_CACHE_DIR": "/data/hf-cache",
     }
     data.update(read_env(CLUSTER_ENV))
     data.update(read_env(NODE_CONF))
@@ -196,17 +198,28 @@ def db_history(since_seconds: int, max_points: int = 240):
 
 
 def db_cost_summary():
-    """Tokens generated and cost-equivalent over windows."""
+    """Tokens generated and cost-equivalent over windows.
+
+    vLLM's generation_tokens_total is cumulative since the engine started and
+    resets to 0 whenever the model is reloaded. A plain MAX-MIN would drop an
+    entire segment after any restart (and can read as 0 across a reset), so sum
+    the positive deltas between consecutive samples instead; a reset shows up as
+    a negative delta we simply skip.
+    """
     now = int(time.time())
     out = {"rate_per_mtok": COST_PER_MTOK}
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         for label, secs in (("today", 86400), ("week", 604800), ("all", 10**12)):
             cutoff = now - secs
-            r = con.execute(
-                "SELECT MIN(gen_total), MAX(gen_total) FROM samples WHERE ts >= ? AND gen_total IS NOT NULL",
-                (cutoff,)).fetchone()
-            lo, hi = r if r else (None, None)
-            tokens = (hi - lo) if (lo is not None and hi is not None and hi >= lo) else 0
+            rows = con.execute(
+                "SELECT gen_total FROM samples WHERE ts >= ? AND gen_total IS NOT NULL ORDER BY ts",
+                (cutoff,)).fetchall()
+            tokens = 0.0
+            prev = None
+            for (g,) in rows:
+                if prev is not None and g > prev:
+                    tokens += g - prev
+                prev = g
             out[label] = {
                 "tokens": int(tokens),
                 "cost_equiv": round(tokens / 1_000_000 * COST_PER_MTOK, 2),
@@ -512,7 +525,7 @@ def gather_status() -> dict:
         "action": _current_action["name"],
         "checks": checks,
         "nodes": {
-            "head": {"ip": c["HEAD_IP"], "iface": c.get("CX7_IFACE", "")},
+            "head": {"ip": c["HEAD_IP"], "iface": c.get("CX7_IFACE", ""), "host": socket.gethostname()},
             "worker": {"ip": c["WORKER_IP"], "host": c["WORKER_SSH_HOST"]},
         },
         "config": {k: cfg().get(k, "") for k in CONFIG_FIELDS},
@@ -549,7 +562,6 @@ def optimize() -> list:
         record("Netplan conflict", "ok", "No conflict.")
 
     # 2. MTU 9000 on the CX7 interface
-    _, mtu = _iface_speed_mtu(iface)[1], None
     _, mtu = _iface_speed_mtu(iface)
     if mtu != "9000":
         rc, _, err = _sudo(["ip", "link", "set", iface, "mtu", "9000"])

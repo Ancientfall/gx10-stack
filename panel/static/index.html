@@ -78,7 +78,12 @@
   .link.down .wire { background: var(--err); }
   @keyframes flow { from { transform: translateX(-22px); } to { transform: translateX(0); } }
   .link .speed { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 9px; letter-spacing: 0.08em; }
-  @media (prefers-reduced-motion: reduce) { .link .wire::after { animation: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .link .wire::after { animation: none; }
+    .spin { animation: none; }
+    .dl-fill.indet { animation: none; width: 100% !important; opacity: 0.55; }
+    .gfill, .dl-fill, .toast { transition: none; }
+  }
 
   /* ---------- overall status + primary actions ---------- */
   .bar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
@@ -134,8 +139,13 @@
   .console .l-error { color: var(--err); }
   .console .l-optimize { color: var(--fabric); }
   .console .l-model { color: var(--accent); }
-  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 9px; max-width: min(92vw, 460px); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  .toast .tdot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .toast .tmsg { line-height: 1.4; }
+  .toast.ok { border-color: var(--up); } .toast.ok .tdot { background: var(--up); }
+  .toast.warn { border-color: var(--warn); } .toast.warn .tdot { background: var(--warn); }
+  .toast.error { border-color: var(--err); } .toast.error .tdot { background: var(--err); }
   .hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
 
   /* live telemetry strip */
@@ -254,6 +264,21 @@
   .testresult .tr-stats { display: flex; gap: 16px; margin-bottom: 10px; font-family: var(--mono); font-size: 12px; }
   .testresult .tr-stats b { color: var(--fabric); }
   .testresult .tr-text { font-size: 13.5px; line-height: 1.5; color: var(--text); white-space: pre-wrap; }
+
+  /* ---------- section grouping: a hairline separates each concern ---------- */
+  .group { padding-top: 24px; margin-top: 24px; border-top: 1px solid var(--line); }
+  .group > .sec { margin-bottom: 10px; }
+  .group-sub { font-size: 12px; color: var(--dim); margin: -2px 0 14px; line-height: 1.5; }
+  .group .pane, .group .imgpane { margin-bottom: 0; }
+  /* collapsible advanced section */
+  details.advanced > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; user-select: none; }
+  details.advanced > summary::-webkit-details-marker { display: none; }
+  details.advanced > summary .sec { margin: 0; }
+  details.advanced > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  details.advanced .adv-tag { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+  details.advanced .chev { margin-left: auto; color: var(--dim); transition: transform .15s; }
+  details.advanced[open] .chev { transform: rotate(90deg); }
+  details.advanced .adv-body { margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -296,159 +321,176 @@
     </div>
   </div>
 
-  <h2 class="sec">Live telemetry</h2>
-  <div class="telemetry" id="telemetry">
-    <div class="metric"><div class="mlabel">Throughput</div><div class="mval" id="m-tps">--</div><div class="munit">tokens/sec</div></div>
-    <div class="metric"><div class="mlabel">In flight</div><div class="mval" id="m-running">--</div><div class="munit">requests</div></div>
-    <div class="metric"><div class="mlabel">Queued</div><div class="mval" id="m-waiting">--</div><div class="munit">waiting</div></div>
-    <div class="metric"><div class="mlabel">Generated</div><div class="mval" id="m-total">--</div><div class="munit">tokens total</div></div>
-  </div>
-  <div class="nodestats" id="nodestats">
-    <div class="nstat">
-      <div class="nstat-head"><span id="ns-head-name">myspark</span><span class="nstat-role">head</span></div>
-      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-head-gpu"></div></div><div class="gpct" id="ns-head-gpu-pct">--</div></div>
-      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-head-mem"></div></div><div class="gpct" id="ns-head-mem-pct">--</div></div>
-      <div class="nstat-extra">
-        <div class="ne"><div class="ne-val" id="ns-head-power">--</div><div class="ne-lbl">Power W</div></div>
-        <div class="ne"><div class="ne-val" id="ns-head-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
-        <div class="ne"><div class="ne-val" id="ns-head-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+  <!-- ===== Cluster health: the breakdown behind the verdict ===== -->
+  <section class="group">
+    <h2 class="sec">Cluster health</h2>
+    <p class="group-sub">Setup and fabric checks. These determine the overall status shown above.</p>
+    <div class="grid" id="checks"></div>
+  </section>
+
+  <!-- ===== Live performance: what the cluster is doing right now ===== -->
+  <section class="group">
+    <h2 class="sec">Live performance</h2>
+    <div class="telemetry" id="telemetry">
+      <div class="metric"><div class="mlabel">Throughput</div><div class="mval" id="m-tps">--</div><div class="munit">tokens/sec</div></div>
+      <div class="metric"><div class="mlabel">In flight</div><div class="mval" id="m-running">--</div><div class="munit">requests</div></div>
+      <div class="metric"><div class="mlabel">Queued</div><div class="mval" id="m-waiting">--</div><div class="munit">waiting</div></div>
+      <div class="metric"><div class="mlabel">Generated</div><div class="mval" id="m-total">--</div><div class="munit">tokens total</div></div>
+    </div>
+    <div class="nodestats" id="nodestats">
+      <div class="nstat">
+        <div class="nstat-head"><span id="ns-head-name">myspark</span><span class="nstat-role">head</span></div>
+        <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-head-gpu"></div></div><div class="gpct" id="ns-head-gpu-pct">--</div></div>
+        <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-head-mem"></div></div><div class="gpct" id="ns-head-mem-pct">--</div></div>
+        <div class="nstat-extra">
+          <div class="ne"><div class="ne-val" id="ns-head-power">--</div><div class="ne-lbl">Power W</div></div>
+          <div class="ne"><div class="ne-val" id="ns-head-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+          <div class="ne"><div class="ne-val" id="ns-head-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+        </div>
+      </div>
+      <div class="nstat">
+        <div class="nstat-head"><span id="ns-worker-name">myspark2</span><span class="nstat-role">worker</span></div>
+        <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-worker-gpu"></div></div><div class="gpct" id="ns-worker-gpu-pct">--</div></div>
+        <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-worker-mem"></div></div><div class="gpct" id="ns-worker-mem-pct">--</div></div>
+        <div class="nstat-extra">
+          <div class="ne"><div class="ne-val" id="ns-worker-power">--</div><div class="ne-lbl">Power W</div></div>
+          <div class="ne"><div class="ne-val" id="ns-worker-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+          <div class="ne"><div class="ne-val" id="ns-worker-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+        </div>
       </div>
     </div>
-    <div class="nstat">
-      <div class="nstat-head"><span id="ns-worker-name">myspark2</span><span class="nstat-role">worker</span></div>
-      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-worker-gpu"></div></div><div class="gpct" id="ns-worker-gpu-pct">--</div></div>
-      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-worker-mem"></div></div><div class="gpct" id="ns-worker-mem-pct">--</div></div>
-      <div class="nstat-extra">
-        <div class="ne"><div class="ne-val" id="ns-worker-power">--</div><div class="ne-lbl">Power W</div></div>
-        <div class="ne"><div class="ne-val" id="ns-worker-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
-        <div class="ne"><div class="ne-val" id="ns-worker-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+  </section>
+
+  <!-- ===== Models & serving: pick, load, tune, and test the served model ===== -->
+  <section class="group">
+    <h2 class="sec">Models &amp; serving</h2>
+
+    <div class="dlbanner hidden" id="dl-banner">
+      <div class="dl-head">
+        <span id="dl-model">model</span>
+        <span class="dl-right"><span id="dl-status">working</span><button class="dl-x" id="dl-dismiss" aria-label="Dismiss">&times;</button></span>
       </div>
+      <div class="dl-track"><div class="dl-fill" id="dl-fill"></div></div>
+      <div class="dl-meta"><span id="dl-detail"></span><span id="dl-speed"></span></div>
     </div>
-  </div>
 
-  <h2 class="sec">Configuration checks</h2>
-  <div class="grid" id="checks"></div>
+    <div class="modeltabs" role="tablist" aria-label="Model views">
+      <button class="mtab active" id="tab-curated" role="tab" aria-selected="true" aria-controls="pane-curated">Favorites</button>
+      <button class="mtab" id="tab-search" role="tab" aria-selected="false" aria-controls="pane-search" tabindex="-1">Discover</button>
+      <button class="mtab" id="tab-library" role="tab" aria-selected="false" aria-controls="pane-library" tabindex="-1">Library</button>
+      <button class="mtab" id="tab-test" role="tab" aria-selected="false" aria-controls="pane-test" tabindex="-1">Test</button>
+    </div>
 
-  <div class="columns">
-    <div>
-      <h2 class="sec">Serving config</h2>
-      <div class="pane">
+    <div class="mpane" id="pane-curated" role="tabpanel" aria-labelledby="tab-curated">
+      <p class="hint" id="budget-line">Loading model budget...</p>
+      <div class="mlist" id="curated-list"></div>
+    </div>
+
+    <div class="mpane hidden" id="pane-search" role="tabpanel" aria-labelledby="tab-search">
+      <div class="searchrow">
+        <input id="search-input" type="text" placeholder="Search Hugging Face, e.g. qwen coder, llama 70b" spellcheck="false" />
+        <button id="search-btn" aria-label="Search models">Search</button>
+      </div>
+      <p class="hint">Footprint estimates are rough (parsed from the model name). Always check the model card for exact size and license.</p>
+      <div class="mlist" id="search-list"></div>
+    </div>
+
+    <div class="mpane hidden" id="pane-library" role="tabpanel" aria-labelledby="tab-library">
+      <p class="hint">Models already downloaded to your cache. Switching to a cached model skips the download.</p>
+      <div class="mlist" id="library-list"></div>
+    </div>
+
+    <div class="mpane hidden" id="pane-test" role="tabpanel" aria-labelledby="tab-test">
+      <div class="field">
+        <label for="test-prompt">Prompt</label>
+        <input id="test-prompt" type="text" value="In one sentence, what is offshore vessel logistics?" spellcheck="false" />
+      </div>
+      <div class="actions">
+        <button id="test-btn" aria-label="Send test prompt">Send to active model</button>
+      </div>
+      <div class="testresult hidden" id="test-result"></div>
+    </div>
+
+    <h3 class="sec" style="margin-top:24px">Serving parameters</h3>
+    <div class="pane">
+      <div class="field">
+        <label for="f-model">Model</label>
+        <input id="f-model" type="text" spellcheck="false" />
+      </div>
+      <div class="row2">
         <div class="field">
-          <label for="f-model">Model</label>
-          <input id="f-model" type="text" spellcheck="false" />
-        </div>
-        <div class="row2">
-          <div class="field">
-            <label for="f-tp">Tensor parallel</label>
-            <input id="f-tp" type="number" min="1" max="2" />
-          </div>
-          <div class="field">
-            <label for="f-util">GPU mem util</label>
-            <input id="f-util" type="number" step="0.01" min="0.4" max="0.95" />
-          </div>
+          <label for="f-tp">Tensor parallel</label>
+          <input id="f-tp" type="number" min="1" max="2" />
         </div>
         <div class="field">
-          <label for="f-len">Max model length</label>
-          <input id="f-len" type="number" step="1024" />
+          <label for="f-util">GPU mem util</label>
+          <input id="f-util" type="number" step="0.01" min="0.4" max="0.95" />
         </div>
-        <div class="actions">
-          <button id="btn-save" aria-label="Save serving config">Save config</button>
-          <button id="btn-reload" aria-label="Reload model now">Reload model now</button>
-          <button id="btn-unload" class="danger" aria-label="Unload model">Unload</button>
-          <button id="btn-rdma" aria-label="Check RDMA transport">Check RDMA</button>
+      </div>
+      <div class="field">
+        <label for="f-len">Max model length</label>
+        <input id="f-len" type="number" step="1024" />
+      </div>
+      <div class="actions">
+        <button id="btn-save" aria-label="Save serving config">Save config</button>
+        <button id="btn-reload" aria-label="Reload model now">Reload model now</button>
+        <button id="btn-unload" class="danger" aria-label="Unload model">Unload</button>
+        <button id="btn-rdma" aria-label="Check RDMA transport">Check RDMA</button>
+      </div>
+      <p class="hint">Save writes to cluster.env and applies on next start. Reload swaps the model in the running cluster without a full restart.</p>
+    </div>
+  </section>
+
+  <!-- ===== Activity & logs ===== -->
+  <section class="group">
+    <h2 class="sec">Activity &amp; logs</h2>
+    <div class="console" id="console" aria-live="polite"></div>
+    <div class="actions" style="margin-top:10px;">
+      <button id="btn-vllm-logs" aria-label="Show vLLM logs">Show vLLM logs</button>
+      <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
+    </div>
+  </section>
+
+  <!-- ===== History & cost ===== -->
+  <section class="group">
+    <h2 class="sec">History &amp; cost</h2>
+    <div class="histbar">
+      <div class="histwin" role="group" aria-label="History window">
+        <button class="hwin active" data-win="hour" aria-pressed="true">Hour</button>
+        <button class="hwin" data-win="day" aria-pressed="false">Day</button>
+        <button class="hwin" data-win="week" aria-pressed="false">Week</button>
+      </div>
+      <div class="costcards" id="cost-cards"></div>
+    </div>
+    <div class="charts">
+      <div class="chart"><div class="chart-title">Throughput (tokens/sec)</div><svg id="chart-tps" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><div class="chart-title">Temperature (&deg;C)</div><svg id="chart-temp" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><div class="chart-title">Power draw (W)</div><svg id="chart-power" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><div class="chart-title">Memory used (GB)</div><svg id="chart-mem" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    </div>
+  </section>
+
+  <!-- ===== Advanced: vLLM image/version maintenance (collapsed by default) ===== -->
+  <details class="group advanced">
+    <summary class="group-summary"><span class="sec">vLLM version &amp; image</span><span class="adv-tag">advanced</span><span class="chev">&#9656;</span></summary>
+    <div class="adv-body">
+      <div class="imgpane">
+        <div class="imgcur" id="img-current">Checking version...</div>
+        <div class="imgbanner hidden" id="img-banner">
+          <div class="dl-head"><span id="img-status">working</span></div>
+          <div class="dl-track"><div class="dl-fill" id="img-fill"></div></div>
+          <div class="dl-meta"><span id="img-detail"></span></div>
         </div>
-        <p class="hint">Save writes to cluster.env and applies on next start. Reload swaps the model in the running cluster without a full restart.</p>
+        <div id="img-candidates"></div>
+        <div id="img-locals"></div>
+        <p class="hint">Updating pulls a newer NVIDIA-validated image (~19GB per node) and rebuilds the Ray layer, keeping your current image so you can roll back. Switching requires a cluster relaunch (Stop then Start). Newer images may add support for the latest model formats (e.g. NVFP4).</p>
       </div>
     </div>
-
-    <div>
-      <h2 class="sec">Activity</h2>
-      <div class="console" id="console" aria-live="polite"></div>
-      <div class="actions" style="margin-top:10px;">
-        <button id="btn-vllm-logs" aria-label="Show vLLM logs">Show vLLM logs</button>
-        <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
-      </div>
-    </div>
-  </div>
-
-  <h2 class="sec">vLLM version &amp; image</h2>
-  <div class="imgpane">
-    <div class="imgcur" id="img-current">Checking version...</div>
-    <div class="imgbanner hidden" id="img-banner">
-      <div class="dl-head"><span id="img-status">working</span></div>
-      <div class="dl-track"><div class="dl-fill" id="img-fill"></div></div>
-      <div class="dl-meta"><span id="img-detail"></span></div>
-    </div>
-    <div id="img-candidates"></div>
-    <div id="img-locals"></div>
-    <p class="hint">Updating pulls a newer NVIDIA-validated image (~19GB per node) and rebuilds the Ray layer, keeping your current image so you can roll back. Switching requires a cluster relaunch (Stop then Start). Newer images may add support for the latest model formats (e.g. NVFP4).</p>
-  </div>
-
-  <h2 class="sec">History &amp; cost</h2>
-  <div class="histbar">
-    <div class="histwin" role="tablist">
-      <button class="hwin active" data-win="hour">Hour</button>
-      <button class="hwin" data-win="day">Day</button>
-      <button class="hwin" data-win="week">Week</button>
-    </div>
-    <div class="costcards" id="cost-cards"></div>
-  </div>
-  <div class="charts">
-    <div class="chart"><div class="chart-title">Throughput (tokens/sec)</div><svg id="chart-tps" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
-    <div class="chart"><div class="chart-title">Temperature (&deg;C)</div><svg id="chart-temp" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
-    <div class="chart"><div class="chart-title">Power draw (W)</div><svg id="chart-power" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
-    <div class="chart"><div class="chart-title">Memory used (GB)</div><svg id="chart-mem" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
-  </div>
-
-  <h2 class="sec">Models</h2>
-  <div class="dlbanner hidden" id="dl-banner">
-    <div class="dl-head">
-      <span id="dl-model">model</span>
-      <span class="dl-right"><span id="dl-status">working</span><button class="dl-x" id="dl-dismiss" aria-label="Dismiss">&times;</button></span>
-    </div>
-    <div class="dl-track"><div class="dl-fill" id="dl-fill"></div></div>
-    <div class="dl-meta"><span id="dl-detail"></span><span id="dl-speed"></span></div>
-  </div>
-  <div class="modeltabs" role="tablist">
-    <button class="mtab active" id="tab-curated" role="tab">Favorites</button>
-    <button class="mtab" id="tab-search" role="tab">Discover</button>
-    <button class="mtab" id="tab-library" role="tab">Library</button>
-    <button class="mtab" id="tab-test" role="tab">Test</button>
-  </div>
-
-  <div class="mpane" id="pane-curated">
-    <p class="hint" id="budget-line">Loading model budget...</p>
-    <div class="mlist" id="curated-list"></div>
-  </div>
-
-  <div class="mpane hidden" id="pane-search">
-    <div class="searchrow">
-      <input id="search-input" type="text" placeholder="Search Hugging Face, e.g. qwen coder, llama 70b" spellcheck="false" />
-      <button id="search-btn" aria-label="Search models">Search</button>
-    </div>
-    <p class="hint">Footprint estimates are rough (parsed from the model name). Always check the model card for exact size and license.</p>
-    <div class="mlist" id="search-list"></div>
-  </div>
-
-  <div class="mpane hidden" id="pane-library">
-    <p class="hint">Models already downloaded to your cache. Switching to a cached model skips the download.</p>
-    <div class="mlist" id="library-list"></div>
-  </div>
-
-  <div class="mpane hidden" id="pane-test">
-    <div class="field">
-      <label for="test-prompt">Prompt</label>
-      <input id="test-prompt" type="text" value="In one sentence, what is offshore vessel logistics?" spellcheck="false" />
-    </div>
-    <div class="actions">
-      <button id="test-btn" aria-label="Send test prompt">Send to active model</button>
-    </div>
-    <div class="testresult hidden" id="test-result"></div>
-  </div>
+  </details>
 
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"><span class="tdot"></span><span class="tmsg"></span></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -458,12 +500,44 @@ const api = async (path, method = "GET", body = null) => {
   const res = await fetch(path, opt);
   return res.json();
 };
-const toast = (msg) => {
+const toast = (msg, type = "") => {
   const el = $("toast");
-  el.textContent = msg;
+  el.querySelector(".tmsg").textContent = msg;
+  el.classList.remove("ok", "warn", "error");
+  if (type) el.classList.add(type);
   el.classList.add("show");
   clearTimeout(el._t);
   el._t = setTimeout(() => el.classList.remove("show"), 3200);
+};
+// colour a toast from an API response: green on ok:true, red on ok:false, neutral otherwise
+const rtype = (r) => (r && r.ok === false ? "error" : r && r.ok === true ? "ok" : "");
+
+// run an async action with a button in a disabled "busy" state, then restore it
+const withBusy = async (btn, label, fn) => {
+  if (!btn) return fn();
+  const prev = btn.textContent, wasOff = btn.disabled;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin"></span>${label}`;
+  try { return await fn(); }
+  finally { btn.disabled = wasOff; btn.textContent = prev; }
+};
+
+// reflect cluster health in the browser tab: title text + a coloured favicon dot
+let _favLink = null;
+const setTab = (overall, running, action) => {
+  const color = { ok: "#3fb950", warn: "#d6a032", error: "#f0564b" }[overall] || "#5b6675";
+  let title;
+  if (action) title = `GX10 · ${action}…`;
+  else if (overall === "ok" && running) title = "GX10 · serving";
+  else if (overall === "ok") title = "GX10 · idle";
+  else if (overall === "warn") title = "GX10 · warnings";
+  else if (overall === "error") title = "GX10 · problem";
+  else title = "GX10 cluster control";
+  if (document.title !== title) document.title = title;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="11" fill="${color}"/></svg>`;
+  const href = "data:image/svg+xml," + encodeURIComponent(svg);
+  if (!_favLink) { _favLink = document.createElement("link"); _favLink.rel = "icon"; document.head.appendChild(_favLink); }
+  if (_favLink.href !== href) _favLink.href = href;
 };
 
 const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }[status] || "");
@@ -471,12 +545,17 @@ const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }
 let configLoaded = false;
 
 const renderStatus = (s) => {
-  // nodes
-  $("head-name").textContent = "myspark";
+  // nodes (names come from config / hostname, refreshed on every poll)
+  const headName = s.nodes.head.host || "head";
+  const workerName = s.nodes.worker.host || "worker";
+  $("head-name").textContent = headName;
   $("head-ip").textContent = s.nodes.head.ip;
   $("head-iface").textContent = s.nodes.head.iface || "cx7";
+  $("worker-name").textContent = workerName;
   $("worker-ip").textContent = s.nodes.worker.ip;
   $("worker-host").textContent = s.nodes.worker.host;
+  $("ns-head-name").textContent = headName;
+  $("ns-worker-name").textContent = workerName;
 
   // map checks by label
   const by = {};
@@ -500,6 +579,9 @@ const renderStatus = (s) => {
   else if (s.overall === "ok") vt.textContent = "Configuration good. Cluster idle.";
   else if (s.overall === "warn") vt.textContent = "Running with warnings. See checks below.";
   else vt.textContent = "Problems found. Review checks or run Optimize.";
+
+  // reflect health in the browser tab + favicon
+  setTab(s.overall, s.running, s.action);
 
   // buttons reflect action state
   const busy = !!s.action;
@@ -567,8 +649,8 @@ const pollActivity = async () => {
 };
 
 // actions
-$("btn-start").onclick = async () => { toast((await api("/api/start", "POST")).detail); pollStatus(); };
-$("btn-stop").onclick = async () => { toast((await api("/api/stop", "POST")).detail); pollStatus(); };
+$("btn-start").onclick = async () => { const r = await api("/api/start", "POST"); toast(r.detail, rtype(r)); pollStatus(); };
+$("btn-stop").onclick = async () => { const r = await api("/api/stop", "POST"); toast(r.detail, rtype(r)); pollStatus(); };
 $("btn-optimize").onclick = async () => {
   $("btn-optimize").disabled = true;
   toast("Running checks and fixes...");
@@ -582,20 +664,24 @@ $("btn-rdma").onclick = async () => {
   toast((await api("/api/rdma-check", "POST")).detail);
   pollActivity();
 };
-$("btn-save").onclick = async () => {
+$("btn-save").onclick = (e) => withBusy(e.currentTarget, "Saving…", async () => {
   const body = {
     MODEL: $("f-model").value.trim(),
     TENSOR_PARALLEL: $("f-tp").value,
     GPU_MEM_UTIL: $("f-util").value,
     MAX_MODEL_LEN: $("f-len").value,
   };
-  toast((await api("/api/config", "POST", body)).detail);
-};
-$("btn-reload").onclick = async () => {
+  const r = await api("/api/config", "POST", body);
+  toast(r.detail, rtype(r));
+});
+$("btn-reload").onclick = (e) => {
   const model = $("f-model").value.trim();
-  if (!model) return toast("Enter a model first.");
-  toast((await api("/api/model", "POST", { model })).detail);
-  pollActivity();
+  if (!model) return toast("Enter a model first.", "warn");
+  return withBusy(e.currentTarget, "Reloading…", async () => {
+    const r = await api("/api/model", "POST", { model });
+    toast(r.detail, rtype(r));
+    pollActivity();
+  });
 };
 $("btn-vllm-logs").onclick = async () => {
   if (consoleMode === "vllm") {
@@ -657,7 +743,7 @@ const wireLoadButtons = (container) => {
       }
       btn.disabled = true; btn.textContent = "Starting...";
       const r = await api("/api/model", "POST", { model });
-      toast(r.detail);
+      toast(r.detail, rtype(r));
       if (!r.ok) { btn.disabled = false; btn.textContent = original; }
       pollDownload(); pollActivity();
     };
@@ -735,17 +821,37 @@ $("test-btn").onclick = async () => {
   res.innerHTML = `<div class="tr-stats"><span><b>${r.tps}</b> tok/s</span><span><b>${r.tokens}</b> tokens</span><span><b>${r.seconds}</b>s</span><span>${r.model}</span></div><div class="tr-text">${r.text.replace(/</g, "&lt;")}</div>`;
 };
 
-// tab switching
+// tab switching (Models): ARIA-aware, keyboard navigable, remembers your last tab
 const tabs = { curated: "pane-curated", search: "pane-search", library: "pane-library", test: "pane-test" };
-Object.keys(tabs).forEach((k) => {
-  $(`tab-${k}`).onclick = () => {
-    Object.keys(tabs).forEach((j) => {
-      $(`tab-${j}`).classList.toggle("active", j === k);
-      $(tabs[j]).classList.toggle("hidden", j !== k);
-    });
-    if (k === "library") loadLibrary();
-  };
+const tabKeys = Object.keys(tabs);
+const activateModelTab = (k, focus = false) => {
+  tabKeys.forEach((j) => {
+    const t = $(`tab-${j}`), on = j === k;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    t.tabIndex = on ? 0 : -1;
+    $(tabs[j]).classList.toggle("hidden", !on);
+  });
+  if (focus) $(`tab-${k}`).focus();
+  try { localStorage.setItem("gx10.modelTab", k); } catch (e) {}
+  if (k === "library") loadLibrary();
+};
+tabKeys.forEach((k, i) => {
+  const t = $(`tab-${k}`);
+  t.onclick = () => activateModelTab(k);
+  t.addEventListener("keydown", (e) => {
+    let ni = null;
+    if (e.key === "ArrowRight") ni = (i + 1) % tabKeys.length;
+    else if (e.key === "ArrowLeft") ni = (i - 1 + tabKeys.length) % tabKeys.length;
+    else if (e.key === "Home") ni = 0;
+    else if (e.key === "End") ni = tabKeys.length - 1;
+    if (ni != null) { e.preventDefault(); activateModelTab(tabKeys[ni], true); }
+  });
 });
+let _savedTab = "curated";
+try { _savedTab = localStorage.getItem("gx10.modelTab") || "curated"; } catch (e) {}
+if (!tabKeys.includes(_savedTab)) _savedTab = "curated";
+activateModelTab(_savedTab);
 
 loadCurated();
 
@@ -806,15 +912,33 @@ const loadHistory = async () => {
   drawChart("chart-mem", s.map((x) => ({ ...x, head_gb: x.head_mem_used ? x.head_mem_used/1024 : null, worker_gb: x.worker_mem_used ? x.worker_mem_used/1024 : null })), "head_gb", "worker_gb", { zeroBase: true });
 };
 
-document.querySelectorAll(".hwin").forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll(".hwin").forEach((x) => x.classList.toggle("active", x === b));
-    histWindow = b.getAttribute("data-win");
-    loadHistory();
-  };
+const winButtons = [...document.querySelectorAll(".hwin")];
+const activateWindow = (b, focus = false) => {
+  winButtons.forEach((x) => {
+    const on = x === b;
+    x.classList.toggle("active", on);
+    x.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  histWindow = b.getAttribute("data-win");
+  try { localStorage.setItem("gx10.histWin", histWindow); } catch (e) {}
+  if (focus) b.focus();
+  loadHistory();
+};
+winButtons.forEach((b, i) => {
+  b.onclick = () => activateWindow(b);
+  b.addEventListener("keydown", (e) => {
+    let ni = null;
+    if (e.key === "ArrowRight") ni = (i + 1) % winButtons.length;
+    else if (e.key === "ArrowLeft") ni = (i - 1 + winButtons.length) % winButtons.length;
+    if (ni != null) { e.preventDefault(); activateWindow(winButtons[ni], true); }
+  });
 });
+let _savedWin = "hour";
+try { _savedWin = localStorage.getItem("gx10.histWin") || "hour"; } catch (e) {}
+const _winBtn = winButtons.find((b) => b.getAttribute("data-win") === _savedWin) || winButtons[0];
+if (_winBtn) activateWindow(_winBtn); else loadHistory();
 
-loadCost(); loadHistory();
+loadCost();
 setInterval(() => { loadCost(); loadHistory(); }, 15000);
 
 // ---------- vLLM version / image manager ----------
@@ -989,7 +1113,7 @@ $("dl-dismiss").onclick = async () => {
 $("btn-unload").onclick = async () => {
   $("btn-unload").disabled = true;
   const r = await api("/api/model/unload", "POST");
-  toast(r.detail);
+  toast(r.detail, rtype(r));
   $("btn-unload").disabled = false;
   pollStatus(); pollDownload();
 };
