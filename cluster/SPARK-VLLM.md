@@ -30,6 +30,14 @@ cd cluster/spark-vllm-docker
 
 Passwordless SSH head→worker is already set up by `01-node-setup.sh`.
 
+> **Networking is eugr's job on this path, not ours.** Reaching the full ~200 Gb/s
+> needs *both* ConnectX-7 ports cabled with per-port IPs and the right topology —
+> that's configured by `./launch-cluster.sh --setup` here. Our `01-node-setup.sh`
+> only handles the base (Docker, NVIDIA toolkit, memlock, cache dir); its
+> single-port netplan is for the *native* kit, so let eugr own the fabric here.
+> (One cable ≈ ~100 Gb/s — each QSFP port is a PCIe Gen5 x4 link; the rated 200 is
+> the two ports combined, not per port.)
+
 ## 2. Build the image and copy to the worker
 
 From the **head**:

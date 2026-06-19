@@ -69,9 +69,24 @@ It prints (but never auto-runs) the bigger node-specific wins: removing old imag
 with `docker rmi`, deleting cached models under `$HF_CACHE_DIR/hub/models--*`, and
 clearing `~/.cache/vllm` / `~/.cache/flashinfer` / `~/.triton` from spark builds.
 
+## Start fresh (reset)
+
+To wipe the cluster software back to a clean slate **without reinstalling the OS**:
+
+```bash
+./reset.sh                    # this node (shows a plan, asks before deleting)
+./reset.sh -c                 # also reset the worker over SSH
+./reset.sh -y --keep-models   # no prompt, but keep downloaded models
+```
+
+It removes the containers, the panel (service, sudoers drop-in, venv, `panel.env`,
+metrics db), the config/netplan/sysctl/limits files node-setup wrote, a nested
+duplicate clone, all vLLM images + build cache, and — unless `--keep-models` — the
+HF model cache and spark build caches. Reboot afterwards, then `./deploy.sh`.
+
 ## Hardware reality check
 
-Each QSFP port is 200Gbps. A single direct cable between the boxes is a 200G link, not 400G. That is still plenty: tensor-parallel traffic for 70B to 120B class models saturates well below that. If you ever want both ports bonded, that requires a switch path and is not part of NVIDIA's two-node playbook.
+Each QSFP port hangs off a PCIe Gen5 x4 link (~100 Gb/s to the host), so a **single cable gives ~100 Gb/s** and the rated **200 Gb/s is the two ports combined — not 400**. Reaching the full ~200 needs both cables with per-port IPs over RoCE/RDMA (the spark engine's autodiscovery handles this; see `SPARK-VLLM.md`). Either way it's plenty: tensor-parallel traffic for 70B–120B class models saturates well below 100 Gb/s, so a single cable works fine for the native kit.
 
 ## Remote access
 
