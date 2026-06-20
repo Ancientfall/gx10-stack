@@ -165,18 +165,30 @@ _db_lock = threading.Lock()
 COST_PER_MTOK = float(os.environ.get("GX10_COST_PER_MTOK", "10.0"))
 
 
+# Columns for the metrics 'samples' table. New columns are appended over time and
+# migrated onto existing DBs via ALTER TABLE in db_init().
+SAMPLE_COLS = [
+    ("ts", "INTEGER PRIMARY KEY"), ("tps", "REAL"), ("gen_total", "REAL"),
+    ("gen_delta", "REAL"),
+    ("head_gpu", "INTEGER"), ("head_mem_used", "INTEGER"), ("head_mem_total", "INTEGER"),
+    ("head_temp", "INTEGER"), ("head_power", "REAL"),
+    ("worker_gpu", "INTEGER"), ("worker_mem_used", "INTEGER"), ("worker_mem_total", "INTEGER"),
+    ("worker_temp", "INTEGER"), ("worker_power", "REAL"),
+    ("ttft_ms", "REAL"), ("itl_ms", "REAL"), ("e2e_ms", "REAL"), ("queue_ms", "REAL"),
+    ("kv_cache", "REAL"), ("req_success", "REAL"), ("req_error", "REAL"),
+    ("model", "TEXT"),
+]
+
+
 def db_init():
     with _db_lock, sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS samples (
-                ts INTEGER PRIMARY KEY,
-                tps REAL, gen_total REAL,
-                head_gpu INTEGER, head_mem_used INTEGER, head_mem_total INTEGER,
-                head_temp INTEGER, head_power REAL,
-                worker_gpu INTEGER, worker_mem_used INTEGER, worker_mem_total INTEGER,
-                worker_temp INTEGER, worker_power REAL,
-                model TEXT
-            )""")
+        cols_sql = ", ".join(f"{n} {t}" for n, t in SAMPLE_COLS)
+        con.execute(f"CREATE TABLE IF NOT EXISTS samples ({cols_sql})")
+        # migrate older DBs: add any columns introduced after the table was created
+        existing = {r[1] for r in con.execute("PRAGMA table_info(samples)").fetchall()}
+        for n, t in SAMPLE_COLS:
+            if n not in existing:
+                con.execute(f"ALTER TABLE samples ADD COLUMN {n} {t.replace(' PRIMARY KEY', '')}")
         con.execute("""
             CREATE TABLE IF NOT EXISTS benchmarks (
                 ts INTEGER PRIMARY KEY,
@@ -188,9 +200,7 @@ def db_init():
 
 
 def db_insert_sample(row: dict):
-    cols = ("ts", "tps", "gen_total", "head_gpu", "head_mem_used", "head_mem_total",
-            "head_temp", "head_power", "worker_gpu", "worker_mem_used", "worker_mem_total",
-            "worker_temp", "worker_power", "model")
+    cols = tuple(n for n, _ in SAMPLE_COLS)
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         con.execute(
             f"INSERT OR REPLACE INTO samples ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})",
@@ -219,13 +229,14 @@ def db_cost_summary():
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         for label, secs in (("today", 86400), ("week", 604800), ("all", 10**12)):
             cutoff = now - secs
+            # sum reset-aware per-sample deltas; correct across vLLM restarts (the old
+            # MAX-MIN of the cumulative counter undercounted / broke on every reload)
             r = con.execute(
-                "SELECT MIN(gen_total), MAX(gen_total) FROM samples WHERE ts >= ? AND gen_total IS NOT NULL",
+                "SELECT COALESCE(SUM(gen_delta), 0) FROM samples WHERE ts >= ? AND gen_delta IS NOT NULL",
                 (cutoff,)).fetchone()
-            lo, hi = r if r else (None, None)
-            tokens = (hi - lo) if (lo is not None and hi is not None and hi >= lo) else 0
+            tokens = int(r[0] or 0) if r else 0
             out[label] = {
-                "tokens": int(tokens),
+                "tokens": tokens,
                 "cost_equiv": round(tokens / 1_000_000 * COST_PER_MTOK, 2),
             }
     return out
@@ -243,23 +254,34 @@ def _collect_once():
     s = m.get("serving", {})
     h = m.get("nodes", {}).get("head", {})
     w = m.get("nodes", {}).get("worker", {})
-    # tps from gen-token delta vs the previous sample
     gen = s.get("gen_tokens_total")
-    tps = None
-    prev = getattr(_collect_once, "_prev", None)
     nowt = time.time()
-    if gen is not None and prev is not None:
-        dt = nowt - prev[1]
-        if dt > 0:
-            tps = max(0.0, (gen - prev[0]) / dt)
+    prev = getattr(_collect_once, "_prev", None)
+    tps = None
+    gen_delta = None
     if gen is not None:
+        if prev is not None:
+            pg, pt = prev
+            dt = nowt - pt
+            # a vLLM/llama restart resets the cumulative counter to ~0; treat a drop
+            # as a reset and count the new run's tokens so far (never negative)
+            gen_delta = (gen - pg) if gen >= pg else gen
+            if dt > 0:
+                tps = max(0.0, gen_delta / dt)
         _collect_once._prev = (gen, nowt)
+
+    def _avg(d):
+        return (d or {}).get("avg_ms")
     db_insert_sample({
-        "ts": int(nowt), "tps": tps, "gen_total": gen,
+        "ts": int(nowt), "tps": tps, "gen_total": gen, "gen_delta": gen_delta,
         "head_gpu": h.get("gpu_util"), "head_mem_used": h.get("mem_used"),
         "head_mem_total": h.get("mem_total"), "head_temp": h.get("temp"), "head_power": h.get("power"),
         "worker_gpu": w.get("gpu_util"), "worker_mem_used": w.get("mem_used"),
         "worker_mem_total": w.get("mem_total"), "worker_temp": w.get("temp"), "worker_power": w.get("power"),
+        "ttft_ms": _avg(s.get("ttft")), "itl_ms": _avg(s.get("itl")),
+        "e2e_ms": _avg(s.get("e2e")), "queue_ms": _avg(s.get("queue")),
+        "kv_cache": s.get("kv_cache_pct"), "req_success": s.get("requests_success_total"),
+        "req_error": None,
         "model": cfg().get("MODEL", ""),
     })
 
@@ -492,6 +514,123 @@ def _parse_prom(text: str, name: str):
     return total if found else None
 
 
+def _parse_prom_hist(text: str, name: str):
+    """Parse a Prometheus histogram family (name_bucket/_sum/_count), summed across
+    label sets. Returns {'sum','count','buckets':[(le, cumulative_count)...]} or None."""
+    buckets = {}
+    total_sum = 0.0
+    total_count = 0.0
+    found = False
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        metric = line.split("{")[0].split(" ")[0]
+        try:
+            val = float(line.rsplit(" ", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if metric == name + "_bucket":
+            found = True
+            m = re.search(r'le="([^"]+)"', line)
+            if m:
+                buckets[m.group(1)] = buckets.get(m.group(1), 0.0) + val
+        elif metric == name + "_sum":
+            found = True
+            total_sum += val
+        elif metric == name + "_count":
+            found = True
+            total_count += val
+    if not found:
+        return None
+
+    def _le(le):
+        return float("inf") if le in ("+Inf", "Inf") else float(le)
+    bl = sorted(buckets.items(), key=lambda kv: _le(kv[0]))
+    return {"sum": total_sum, "count": total_count,
+            "buckets": [(_le(le), c) for le, c in bl]}
+
+
+def _hist_avg(h):
+    if not h or not h.get("count"):
+        return None
+    return h["sum"] / h["count"]
+
+
+def _hist_quantile(h, q):
+    """Approximate a quantile from cumulative histogram buckets via linear interp."""
+    if not h:
+        return None
+    buckets = h.get("buckets") or []
+    total = h.get("count") or 0
+    if not buckets or total <= 0:
+        return None
+    target = q * total
+    prev_le, prev_c = 0.0, 0.0
+    for le, c in buckets:
+        if c >= target:
+            if le == float("inf"):
+                return prev_le if prev_le > 0 else None
+            if c == prev_c:
+                return le
+            return prev_le + (target - prev_c) / (c - prev_c) * (le - prev_le)
+        prev_le, prev_c = le, c
+    last = buckets[-1][0]
+    return prev_le if last == float("inf") else last
+
+
+def _latency_block(h):
+    """Turn a seconds-histogram into a ms summary block for the UI."""
+    if not h:
+        return {"avg_ms": None, "p50_ms": None, "p95_ms": None, "p99_ms": None}
+    ms = lambda v: round(v * 1000, 1) if v is not None else None
+    return {"avg_ms": ms(_hist_avg(h)),
+            "p50_ms": ms(_hist_quantile(h, 0.50)),
+            "p95_ms": ms(_hist_quantile(h, 0.95)),
+            "p99_ms": ms(_hist_quantile(h, 0.99))}
+
+
+def _vllm_serving(body: str) -> dict:
+    """Rich serving metrics from a vLLM /metrics body."""
+    kv = _parse_prom(body, "vllm:gpu_cache_usage_perc")
+    return {
+        "gen_tokens_total": _parse_prom(body, "vllm:generation_tokens_total"),
+        "prompt_tokens_total": _parse_prom(body, "vllm:prompt_tokens_total"),
+        "requests_running": _parse_prom(body, "vllm:num_requests_running"),
+        "requests_waiting": _parse_prom(body, "vllm:num_requests_waiting"),
+        "requests_success_total": _parse_prom(body, "vllm:request_success_total"),
+        "kv_cache_pct": round(kv * 100, 1) if kv is not None else None,
+        "ttft": _latency_block(_parse_prom_hist(body, "vllm:time_to_first_token_seconds")),
+        "itl": _latency_block(_parse_prom_hist(body, "vllm:time_per_output_token_seconds")),
+        "e2e": _latency_block(_parse_prom_hist(body, "vllm:e2e_request_latency_seconds")),
+        "queue": _latency_block(_parse_prom_hist(body, "vllm:request_queue_time_seconds")),
+    }
+
+
+def _llama_serving(body: str) -> dict:
+    """Rich serving metrics from a llama.cpp /metrics body. llama.cpp exposes fewer
+    fields than vLLM (no latency histograms), so TTFT/ITL are averages where derivable."""
+    gen = _parse_prom(body, "llamacpp:tokens_predicted_total")
+    pred_secs = _parse_prom(body, "llamacpp:tokens_predicted_seconds_total")
+    prompt_secs = _parse_prom(body, "llamacpp:prompt_seconds_total")
+    n_decode = _parse_prom(body, "llamacpp:n_decode_total")
+    kv = _parse_prom(body, "llamacpp:kv_cache_usage_ratio")
+    none4 = {"avg_ms": None, "p50_ms": None, "p95_ms": None, "p99_ms": None}
+    itl_avg = round(pred_secs / gen * 1000, 1) if (gen and pred_secs) else None
+    ttft_avg = round(prompt_secs / n_decode * 1000, 1) if (n_decode and prompt_secs) else None
+    return {
+        "gen_tokens_total": gen,
+        "prompt_tokens_total": _parse_prom(body, "llamacpp:prompt_tokens_total"),
+        "requests_running": _parse_prom(body, "llamacpp:requests_processing"),
+        "requests_waiting": _parse_prom(body, "llamacpp:requests_deferred"),
+        "requests_success_total": None,
+        "kv_cache_pct": round(kv * 100, 1) if kv is not None else None,
+        "ttft": {**none4, "avg_ms": ttft_avg},
+        "itl": {**none4, "avg_ms": itl_avg},
+        "e2e": dict(none4),
+        "queue": dict(none4),
+    }
+
+
 def gather_metrics() -> dict:
     """Live serving throughput. Reads vLLM /metrics when vLLM serves, or
     llama.cpp /metrics when llama.cpp serves, so the stats reflect whichever
@@ -503,34 +642,16 @@ def gather_metrics() -> dict:
     rc, body, _ = run(["curl", "-s", "--max-time", "4",
                        f"http://localhost:{c['API_PORT']}/metrics"], timeout=6)
     if rc == 0 and body and "vllm:" in body:
-        gen = _parse_prom(body, "vllm:generation_tokens_total")
-        prompt = _parse_prom(body, "vllm:prompt_tokens_total")
-        running = _parse_prom(body, "vllm:num_requests_running")
-        waiting = _parse_prom(body, "vllm:num_requests_waiting")
         out["engine"] = "vllm"
-        out["serving"] = {
-            "gen_tokens_total": gen,
-            "prompt_tokens_total": prompt,
-            "requests_running": running,
-            "requests_waiting": waiting,
-        }
+        out["serving"] = _vllm_serving(body)
     else:
         # try llama.cpp metrics (port 8001). llama-server exposes Prometheus
         # metrics at /metrics when run with --metrics; field names differ.
         rcl, lbody, _ = run(["curl", "-s", "--max-time", "4",
                              f"http://localhost:{LLAMA_PORT}/metrics"], timeout=6)
         if rcl == 0 and lbody and "llamacpp:" in lbody:
-            gen = _parse_prom(lbody, "llamacpp:tokens_predicted_total")
-            prompt = _parse_prom(lbody, "llamacpp:prompt_tokens_total")
-            running = _parse_prom(lbody, "llamacpp:requests_processing")
-            waiting = _parse_prom(lbody, "llamacpp:requests_deferred")
             out["engine"] = "llamacpp"
-            out["serving"] = {
-                "gen_tokens_total": gen,
-                "prompt_tokens_total": prompt,
-                "requests_running": running,
-                "requests_waiting": waiting,
-            }
+            out["serving"] = _llama_serving(lbody)
         elif llama_serving():
             # llama.cpp is up but metrics not exposed (no --metrics flag);
             # report it as serving so the UI shows the engine, stats as 0
@@ -624,6 +745,141 @@ def gather_status() -> dict:
         },
         "config": {k: cfg().get(k, "") for k in CONFIG_FIELDS},
     }
+
+
+def gather_telemetry() -> dict:
+    """Live telemetry snapshot for the Telemetry tab: latency blocks (TTFT/ITL/e2e/
+    queue, avg + p50/p95/p99), KV-cache %, queue depth, success counts, and recent
+    tokens/sec. Reuses the cached metrics fetch + the latest collector sample."""
+    m = cached("metrics", 2.5, gather_metrics)
+    serving = m.get("serving", {}) or {}
+    tps = None
+    try:
+        with _db_lock, sqlite3.connect(DB_PATH) as con:
+            r = con.execute(
+                "SELECT tps FROM samples WHERE tps IS NOT NULL ORDER BY ts DESC LIMIT 1").fetchone()
+            if r and r[0] is not None:
+                tps = round(r[0], 1)
+    except Exception:
+        pass
+    return {"engine": m.get("engine"), "tps": tps, "serving": serving}
+
+
+# ------------------------------------------------------------
+# Benchmark runner: fires concurrent streaming requests, measures TTFT + tok/s,
+# records into the (previously unused) benchmarks table.
+# ------------------------------------------------------------
+_benchmark = {"active": False, "status": "idle", "detail": "", "result": None, "error": None}
+_benchmark_lock = threading.Lock()
+
+
+def _bench_one(prompt: str, max_tokens: int, port: str, model: str):
+    """One streaming chat request. Returns (ttft_s, gen_chunks, total_s) or None."""
+    import urllib.request
+    payload = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": max_tokens, "stream": True}).encode()
+    req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions",
+                                 data=payload, headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    ttft = None
+    chunks = 0
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                if ttft is None:
+                    ttft = time.time() - t0
+                try:
+                    delta = json.loads(data)["choices"][0].get("delta", {}).get("content")
+                    if delta:
+                        chunks += 1
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    return (ttft, chunks, time.time() - t0)
+
+
+def _benchmark_worker(concurrency: int, prompt: str, max_tokens: int):
+    eng = active_engine()
+    c = cfg()
+    port = eng.get("port") or c.get("API_PORT", "8000")
+    model = eng.get("model") or ""
+    if not model:
+        with _benchmark_lock:
+            _benchmark.update(active=False, status="error",
+                              error="No model is serving. Load one first.", result=None)
+        return
+    with _benchmark_lock:
+        _benchmark.update(active=True, status="running", error=None, result=None,
+                          detail=f"Running {concurrency} concurrent requests against {model}...")
+    log_line(f"[bench] start: {concurrency} concurrent vs {model}")
+    results = []
+    rlock = threading.Lock()
+
+    def task():
+        r = _bench_one(prompt, max_tokens, port, model)
+        if r:
+            with rlock:
+                results.append(r)
+    threads = [threading.Thread(target=task) for _ in range(concurrency)]
+    t0 = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    duration = time.time() - t0
+    if not results:
+        with _benchmark_lock:
+            _benchmark.update(active=False, status="error",
+                              error="All benchmark requests failed.", result=None)
+        return
+    ttfts = [r[0] for r in results if r[0] is not None]
+    total_toks = sum(r[1] for r in results)
+    avg_ttft = round(sum(ttfts) / len(ttfts) * 1000, 1) if ttfts else None
+    agg_tps = round(total_toks / duration, 1) if duration > 0 else None
+    summary = {"model": model, "concurrency": concurrency, "requests": len(results),
+               "ttft_ms": avg_ttft, "tps": agg_tps, "total_tokens": total_toks,
+               "duration_s": round(duration, 2), "max_tokens": max_tokens}
+    try:
+        with _db_lock, sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO benchmarks (ts,model,concurrency,prompt_tokens,"
+                "max_tokens,ttft_ms,tps,total_tokens,duration_s,notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (int(time.time()), model, concurrency, len(prompt.split()), max_tokens,
+                 avg_ttft, agg_tps, total_toks, round(duration, 2), ""))
+            con.commit()
+    except Exception:
+        pass
+    with _benchmark_lock:
+        _benchmark.update(active=False, status="done", result=summary,
+                          detail=f"{agg_tps} tok/s aggregate, TTFT {avg_ttft}ms")
+    log_line(f"[bench] done: {agg_tps} tok/s, TTFT {avg_ttft}ms")
+
+
+def start_benchmark(concurrency: int, prompt: str, max_tokens: int) -> dict:
+    with _benchmark_lock:
+        if _benchmark["active"]:
+            return {"ok": False, "detail": "A benchmark is already running."}
+        _benchmark.update(active=True, status="starting", error=None, result=None)
+    threading.Thread(target=_benchmark_worker,
+                     args=(concurrency, prompt, max_tokens), daemon=True).start()
+    return {"ok": True, "detail": "Benchmark started."}
+
+
+def benchmark_history(limit: int = 20) -> list:
+    try:
+        with _db_lock, sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("SELECT * FROM benchmarks ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 # ------------------------------------------------------------
@@ -2181,6 +2437,37 @@ def api_history(window: str = "hour"):
 @app.get("/api/cost")
 def api_cost():
     return JSONResponse(db_cost_summary())
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    return JSONResponse(cached("telemetry", 2.0, gather_telemetry))
+
+
+@app.get("/api/telemetry/history")
+def api_telemetry_history(window: str = "hour"):
+    secs = {"hour": 3600, "day": 86400, "week": 604800}.get(window, 3600)
+    return JSONResponse({"window": window, "samples": db_history(secs)})
+
+
+@app.post("/api/benchmark")
+def api_benchmark(payload: dict = Body(...)):
+    concurrency = max(1, min(64, _as_int(payload.get("concurrency"), 4)))
+    prompt = (payload.get("prompt") or
+              "Write a short paragraph about the future of computing.").strip()
+    max_tokens = max(1, min(2048, _as_int(payload.get("max_tokens"), 128)))
+    return JSONResponse(start_benchmark(concurrency, prompt, max_tokens))
+
+
+@app.get("/api/benchmark/status")
+def api_benchmark_status():
+    with _benchmark_lock:
+        return JSONResponse(dict(_benchmark))
+
+
+@app.get("/api/benchmark/history")
+def api_benchmark_history():
+    return JSONResponse({"benchmarks": benchmark_history()})
 
 
 @app.get("/api/engine/active")
