@@ -22,7 +22,7 @@ import collections
 from pathlib import Path
 
 from fastapi import FastAPI, Body
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # ------------------------------------------------------------
@@ -2468,6 +2468,34 @@ def api_benchmark_status():
 @app.get("/api/benchmark/history")
 def api_benchmark_history():
     return JSONResponse({"benchmarks": benchmark_history()})
+
+
+@app.post("/api/chat")
+def api_chat(payload: dict = Body(...)):
+    """Streaming chat proxy to whichever engine is serving. Keeps the browser
+    single-origin; the frontend times TTFT (first token) and tok/s off this stream."""
+    eng = active_engine()
+    port = eng.get("port") or cfg().get("API_PORT", "8000")
+    model = eng.get("model")
+    if not model:
+        return JSONResponse({"ok": False, "detail": "No model is serving. Load one first."},
+                            status_code=409)
+    messages = payload.get("messages") or []
+    max_tokens = max(1, min(8192, _as_int(payload.get("max_tokens"), 512)))
+    body = json.dumps({"model": model, "messages": messages,
+                       "max_tokens": max_tokens, "stream": True}).encode()
+
+    def gen():
+        import urllib.request
+        req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions",
+                                     data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                for raw in resp:
+                    yield raw
+        except Exception as e:
+            yield ("data: " + json.dumps({"error": str(e)[:200]}) + "\n\n").encode()
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/engine/active")
