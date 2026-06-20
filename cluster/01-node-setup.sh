@@ -170,6 +170,38 @@ root hard memlock unlimited
 EOF
 
 # ------------------------------------------------------------
+# 6b. Optional second RDMA rail (dual-rail bandwidth)
+# ------------------------------------------------------------
+# The 2nd ConnectX-7 sits on a separate PCIe root, so a cable on it roughly doubles
+# NCCL bandwidth (~14 -> ~24 GB/s). That NIC is NetworkManager-unmanaged, so netplan
+# can't configure it; a systemd one-shot brings it up on a 2nd subnet on every boot.
+if [[ -n "${RAIL2_IFACE:-}" ]]; then
+    if [[ "${ROLE}" == "head" ]]; then RAIL2_IP="${RAIL2_HEAD_IP}"; else RAIL2_IP="${RAIL2_WORKER_IP}"; fi
+    if [[ -z "${RAIL2_IP:-}" ]]; then
+        warn "RAIL2_IFACE set but RAIL2_${ROLE^^}_IP is empty; skipping second rail."
+    else
+        IP_BIN="$(command -v ip)"
+        log "Installing gx10-rail2.service for ${RAIL2_IFACE} -> ${RAIL2_IP}/${CX7_SUBNET_PREFIX:-24}"
+        cat > /etc/systemd/system/gx10-rail2.service <<EOF
+[Unit]
+Description=GX10 second RDMA rail (${RAIL2_IFACE})
+After=network-pre.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${IP_BIN} addr replace ${RAIL2_IP}/${CX7_SUBNET_PREFIX:-24} dev ${RAIL2_IFACE}
+ExecStart=${IP_BIN} link set ${RAIL2_IFACE} mtu 9000 up
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now gx10-rail2.service \
+            && echo "Second rail up: ${RAIL2_IFACE} ${RAIL2_IP}" \
+            || warn "Could not start gx10-rail2.service (check the iface name in cluster.env)."
+    fi
+fi
+
+# ------------------------------------------------------------
 # 7. Model cache dir + SSH key
 # ------------------------------------------------------------
 log "Creating model cache directory ${HF_CACHE_DIR}"

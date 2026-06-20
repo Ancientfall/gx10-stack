@@ -37,11 +37,48 @@ fi
 
 if [[ "${1:-}" == "--bw" ]]; then
     echo
-    echo "=== 2b. RDMA bandwidth (ib_write_bw, ~10s) ==="
-    ${SSH_WORKER} "nohup ib_write_bw -d \$(ibdev2netdev | awk '/(Up)/{print \$1; exit}') >/dev/null 2>&1 &" || true
+    echo "=== 2b. RDMA verbs bandwidth (ib_write_bw, ~10s) ==="
+    DEV="$(ibdev2netdev | awk '/\(Up\)/{print $1; exit}')"
+    ${SSH_WORKER} "nohup ib_write_bw -d ${DEV} >/dev/null 2>&1 &" </dev/null || true
     sleep 2
-    ib_write_bw -d "$(ibdev2netdev | awk '/\(Up\)/{print $1; exit}')" "${WORKER_IP}" || bad "ib_write_bw failed"
-    info "Expect roughly 180+ Gb/s average on a healthy 200G DAC link"
+    ib_write_bw -d "${DEV}" "${WORKER_IP}" || bad "ib_write_bw failed"
+    ${SSH_WORKER} "pkill ib_write_bw" </dev/null 2>/dev/null || true
+    info "Raw verbs BW only. On GB10 (no GPUDirect RDMA) this does NOT equal NCCL throughput -- see 2c."
+
+    echo
+    echo "=== 2c. NCCL all-reduce over RDMA (authoritative; ~20s) ==="
+    # The real test of what TP serving sees: a 2-rank all-reduce. Confirms NET/IB
+    # (not TCP fallback) and measures busbw (single-rail ~14, dual-rail ~24 GB/s).
+    if docker ps --format '{{.Names}}' | grep -q '^vllm-node$'; then
+        AR='import time,datetime,torch,torch.distributed as dist
+dist.init_process_group(backend="nccl",timeout=datetime.timedelta(seconds=45))
+r=dist.get_rank();torch.cuda.set_device(0)
+x=torch.ones(1024*1024*1024//4,device="cuda")
+for _ in range(5): dist.all_reduce(x)
+torch.cuda.synchronize();N=20;t=time.time()
+for _ in range(N): dist.all_reduce(x)
+torch.cuda.synchronize();bw=x.numel()*4/((time.time()-t)/N)/1e9
+print(f"NCCL_BUSBW={bw:.2f}") if r==0 else None
+dist.destroy_process_group()'
+        docker exec -i vllm-node bash -c "cat > /tmp/_ar.py" <<<"$AR"
+        ${SSH_WORKER} "docker exec -i vllm-node bash -c 'cat > /tmp/_ar.py'" <<<"$AR"
+        AR_ENV="-e WORLD_SIZE=2 -e MASTER_ADDR=${HEAD_IP} -e MASTER_PORT=29600 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=NET"
+        ${SSH_WORKER} "docker exec -e RANK=1 ${AR_ENV} vllm-node python3 /tmp/_ar.py" </dev/null >/tmp/_ar_w.log 2>&1 &
+        sleep 3
+        timeout 90 docker exec -e RANK=0 ${AR_ENV} vllm-node python3 /tmp/_ar.py >/tmp/_ar_h.log 2>&1
+        wait
+        BW="$(grep -oE 'NCCL_BUSBW=[0-9.]+' /tmp/_ar_h.log | cut -d= -f2)"
+        if grep -q 'Using network IB' /tmp/_ar_h.log; then
+            ok "NCCL on NET/IB (RDMA), busbw ${BW:-?} GB/s  (single-rail ~14, dual-rail ~24)"
+        else
+            bad "NCCL NOT on NET/IB (likely TCP fallback), busbw ${BW:-?} GB/s -- check NCCL_IB_HCA / NCCL_NET_PLUGIN=none"
+        fi
+        docker exec vllm-node rm -f /tmp/_ar.py 2>/dev/null
+        ${SSH_WORKER} "docker exec vllm-node rm -f /tmp/_ar.py" </dev/null 2>/dev/null || true
+        rm -f /tmp/_ar_h.log /tmp/_ar_w.log
+    else
+        info "vllm-node not running; start the cluster (02-launch-cluster.sh) before the NCCL bw test."
+    fi
 fi
 
 echo

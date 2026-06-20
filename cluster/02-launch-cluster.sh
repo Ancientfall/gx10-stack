@@ -87,20 +87,23 @@ ${SSH_WORKER} "docker rm -f ${CONTAINER_NAME}" 2>/dev/null || true
 # ------------------------------------------------------------
 # Shared docker flags
 # ------------------------------------------------------------
-# --network host       : Ray + NCCL need the real interfaces, no bridge NAT
-# --device/-v infiniband: expose CX7 RDMA devices to NCCL
-# --ulimit memlock=-1  : RDMA pinned memory registration
-# --shm-size 32g       : prevents bus errors during tensor-parallel ops
+# --network host        : Ray + NCCL need the real interfaces, no bridge NAT
+# --device /dev/infiniband + --cap-add=IPC_LOCK : RDMA verbs need the devices AND
+#                         the capability to pin memory (memlock ulimit alone isn't enough)
+# --ipc host            : shared memory for tensor-parallel ops (replaces --shm-size)
+# NCCL block            : GB10 has no GPUDirect RDMA, so NCCL_NET_PLUGIN=none forces the
+#                         native IB-verbs path; pin NCCL_IB_HCA/GID or it falls back to TCP.
+#                         MERGE_NICS + QPS tuning give dual-rail ~24 GB/s (vs ~14 single).
 common_flags() {
     local host_ip="$1" iface="$2"
     cat <<EOF
 --gpus all \
 --network host \
 --ipc host \
---shm-size 32g \
 --ulimit memlock=-1 \
 --ulimit stack=67108864 \
--v /dev/infiniband:/dev/infiniband \
+--ulimit nofile=1048576 \
+--cap-add=IPC_LOCK \
 --device /dev/infiniband \
 -v ${HF_CACHE_DIR}:/root/.cache/huggingface \
 -e HF_TOKEN=${HF_TOKEN} \
@@ -109,7 +112,15 @@ common_flags() {
 -e GLOO_SOCKET_IFNAME=${iface} \
 -e UCX_NET_DEVICES=${iface} \
 -e NCCL_IB_DISABLE=0 \
--e NCCL_DEBUG=WARN \
+-e NCCL_NET_PLUGIN=none \
+-e NCCL_IB_HCA=${IB_HCA:-rocep1s0f1} \
+-e NCCL_IB_GID_INDEX=${IB_GID_INDEX:-3} \
+-e NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS:-1} \
+-e NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1} \
+-e NCCL_IB_QPS_PER_CONNECTION=${NCCL_IB_QPS_PER_CONNECTION:-4} \
+-e NCCL_IB_SPLIT_DATA_ON_QPS=${NCCL_IB_SPLIT_DATA_ON_QPS:-1} \
+-e NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0} \
+-e NCCL_DEBUG=${NCCL_DEBUG:-WARN} \
 -e RAY_memory_monitor_refresh_ms=0
 EOF
 }
