@@ -1,0 +1,23 @@
+# Secrets and local config (never commit your HF token)
+cluster.env
+*.env.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Editor backups (e.g. setup-gx10-ai.sh~)
+*~
+*.swp
+
+# Local artifacts
+*.log
+hf-cache/
+nccl-tests/
+discover-sparks/
+
+# OS noise
+.DS_Store
+gx10-metrics.db
+*.db

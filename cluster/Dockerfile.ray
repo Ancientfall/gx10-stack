@@ -1,0 +1,6 @@
+# Adds Ray back to the NGC vLLM image. Recent vLLM dropped Ray as a dependency,
+# so nvcr.io/nvidia/vllm no longer ships the `ray` CLI that multi-node needs.
+ARG BASE=nvcr.io/nvidia/vllm:26.04-py3
+FROM ${BASE}
+RUN pip install --no-cache-dir "ray[default]" \
+ && python3 -c "import ray; print('Ray', ray.__version__)"

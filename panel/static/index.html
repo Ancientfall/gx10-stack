@@ -1,0 +1,1587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GX10 Cluster Control</title>
+<style>
+  :root {
+    --bg: #090d12;
+    --panel: #111823;
+    --raised: #18212e;
+    --line: #243040;
+    --text: #e6edf3;
+    --muted: #8a97a8;
+    --dim: #5b6675;
+    --up: #3fb950;
+    --warn: #d6a032;
+    --err: #f0564b;
+    --fabric: #2dd4bf;
+    --fabric-dim: #135e57;
+    --accent: #4ea1f0;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  body {
+    min-height: 100vh;
+    background-image: radial-gradient(circle at 20% -10%, #13202e 0%, transparent 45%),
+                      radial-gradient(circle at 90% 0%, #10201d 0%, transparent 40%);
+    padding: 28px 20px 60px;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
+  .title { font-size: 13px; letter-spacing: 0.32em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .title b { color: var(--text); }
+  .clock { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+
+  /* ---------- signature: the fabric link hero ---------- */
+  .fabric {
+    position: relative;
+    margin: 20px 0 26px;
+    padding: 30px 26px;
+    background: linear-gradient(180deg, var(--panel), #0d141d);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 18px;
+    overflow: hidden;
+  }
+  .node { text-align: center; }
+  .node .role { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); }
+  .node .name { font-family: var(--mono); font-size: 22px; font-weight: 600; margin: 4px 0 2px; }
+  .node .ip { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .node .chip {
+    display: inline-flex; align-items: center; gap: 6px; margin-top: 10px;
+    font-size: 11px; font-family: var(--mono); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.up { background: var(--up); box-shadow: 0 0 10px var(--up); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+  .dot.err { background: var(--err); box-shadow: 0 0 10px var(--err); }
+
+  .link { position: relative; width: 200px; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .link .wire { position: relative; width: 100%; height: 3px; border-radius: 3px; background: var(--fabric-dim); overflow: hidden; }
+  .link .wire::after {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(90deg, transparent 0 10px, var(--fabric) 10px 22px);
+    opacity: 0; animation: flow 1.1s linear infinite;
+  }
+  .link.live .wire { background: var(--fabric); box-shadow: 0 0 16px var(--fabric-dim); }
+  .link.live .wire::after { opacity: 0.85; }
+  .link.degraded .wire { background: var(--warn); }
+  .link.down .wire { background: var(--err); }
+  @keyframes flow { from { transform: translateX(-22px); } to { transform: translateX(0); } }
+  .link .speed { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 9px; letter-spacing: 0.08em; }
+  @media (prefers-reduced-motion: reduce) { .link .wire::after { animation: none; } }
+
+  /* ---------- overall status + primary actions ---------- */
+  .bar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  .verdict { display: flex; align-items: center; gap: 11px; font-size: 15px; }
+  .verdict .big { width: 11px; height: 11px; border-radius: 50%; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font-family: var(--sans); font-size: 14px; font-weight: 600; color: var(--text);
+    background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 18px; cursor: pointer; transition: border-color .15s, background .15s, transform .05s;
+  }
+  button:hover { border-color: var(--dim); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--up); border-color: var(--up); color: #06140a; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { border-color: #5a2a28; color: #f5a6a0; }
+  button.danger:hover { border-color: var(--err); }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -2px; margin-right: 7px; animation: rot .7s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+
+  /* ---------- check grid ---------- */
+  h2.sec { font-size: 11px; letter-spacing: 0.26em; text-transform: uppercase; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 12px; margin-bottom: 26px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 15px; border-left: 3px solid var(--dim); }
+  .card.ok { border-left-color: var(--up); }
+  .card.warn { border-left-color: var(--warn); }
+  .card.error { border-left-color: var(--err); }
+  .card.idle { border-left-color: var(--dim); }
+  .card .label { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .card .detail { font-size: 12.5px; color: var(--muted); margin-top: 6px; line-height: 1.45; font-family: var(--mono); }
+
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 760px) { .columns { grid-template-columns: 1fr; } .fabric { grid-template-columns: 1fr; } .link { width: 100%; transform: rotate(90deg) scale(0.8); margin: 8px 0; } }
+
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 22px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+  .field input {
+    width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); font-family: var(--mono); font-size: 13px; padding: 9px 11px;
+  }
+  .field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  .console {
+    background: #070b0f; border: 1px solid var(--line); border-radius: 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    padding: 12px 14px; height: 260px; overflow-y: auto; color: #b9c4d2;
+  }
+  .console .t { color: var(--dim); margin-right: 8px; }
+  .console .l-error { color: var(--err); }
+  .console .l-optimize { color: var(--fabric); }
+  .console .l-model { color: var(--accent); }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  .hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
+
+  /* live telemetry strip */
+  .telemetry { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .metric .mlabel { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
+  .metric .mval { font-family: var(--mono); font-size: 30px; font-weight: 600; color: var(--fabric); line-height: 1.1; margin-top: 4px; }
+  .metric .munit { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .nodestats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 26px; }
+  @media (max-width: 760px) { .nodestats { grid-template-columns: 1fr; } }
+  .nstat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .nstat-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+  .nstat-head span:first-child { font-family: var(--mono); font-weight: 600; font-size: 14px; }
+  .nstat-role { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim); }
+  .gauge { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .gauge-label { font-size: 11px; color: var(--muted); width: 52px; flex: none; font-family: var(--mono); }
+  .gbar { flex: 1; height: 8px; background: var(--bg); border-radius: 5px; overflow: hidden; border: 1px solid var(--line); }
+  .gfill { height: 100%; width: 0%; background: var(--fabric); border-radius: 5px; transition: width .6s ease; }
+  .gfill.mem { background: var(--accent); }
+  .gfill.hot { background: var(--warn); }
+  .gfill.crit { background: var(--err); }
+  .gpct { font-family: var(--mono); font-size: 12px; color: var(--muted); width: 64px; text-align: right; flex: none; }
+
+  /* models section */
+  .hidden { display: none; }
+  .modeltabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .mtab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 14px; color: var(--muted); font-size: 13px; font-weight: 600; }
+  .mtab:hover { color: var(--text); border-color: transparent; }
+  .mtab.active { color: var(--fabric); border-bottom-color: var(--fabric); }
+  .mpane { margin-bottom: 26px; }
+  .mlist { display: block; }
+  .mlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 16px; }
+  .pager button { padding: 7px 16px; font-size: 13px; }
+  .pg-info { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+  /* image / version manager */
+  .imgpane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 26px; }
+  .imgcur { font-family: var(--mono); font-size: 13px; color: var(--text); margin-bottom: 12px; }
+  .imgcur b { color: var(--fabric); }
+  .imgrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; }
+  .imgrow .ir-tag { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .imgrow .ir-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .imgrow .ir-act { display: flex; gap: 8px; }
+  .imgrow button { padding: 6px 14px; font-size: 12.5px; }
+  .imgbanner { border: 1px solid var(--fabric-dim); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+  .ir-new { color: var(--fabric); }
+  .ir-have { color: var(--up); }
+
+  /* tabs */
+  .tabbar { display: flex; align-items: center; gap: 4px; margin: 8px 0 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .tab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 18px; font-size: 14px; color: var(--muted); cursor: pointer; }
+  .tab:hover { color: var(--text); border-bottom-color: var(--line); }
+  .tab.active { color: var(--fabric); border-bottom-color: var(--fabric); }
+  .tabpane { display: none; }
+  .tabpane.active { display: block; }
+  .engine-toggle { margin-left: auto; display: flex; align-items: center; gap: 4px; padding: 4px 0; }
+  .et-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); margin-right: 6px; }
+  .et-opt { background: var(--raised); border: 1px solid var(--line); border-radius: 7px; padding: 5px 12px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .et-opt.active { color: var(--fabric); border-color: var(--fabric-dim); background: rgba(0,200,160,0.08); }
+
+  /* now-serving status line */
+  .now-serving { display: flex; align-items: center; gap: 10px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 18px; font-family: var(--mono); font-size: 13.5px; }
+  .ns-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex-shrink: 0; }
+  .ns-dot.live { background: var(--up); box-shadow: 0 0 8px var(--up); }
+  .ns-dot.down { background: var(--err); }
+
+  /* storage bar + library manager */
+  .storage-bar { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+  .sb-info { font-family: var(--mono); font-size: 13px; margin-bottom: 8px; }
+  .sb-track { height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .sb-fill { height: 100%; width: 0%; background: var(--fabric); border-radius: 6px; transition: width .4s ease; }
+  .sb-fill.warn { background: var(--accent); }
+  .sb-fill.crit { background: var(--err); }
+  .sb-path { display: flex; gap: 8px; margin-top: 10px; }
+  .sb-path input { flex: 1; padding: 7px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: 12px; }
+  .libitem { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; }
+  .libitem.active { border-color: var(--up); background: rgba(80,200,120,0.05); }
+  .li-left { min-width: 0; flex: 1; }
+  .li-name { font-family: var(--mono); font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .li-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .li-badge { display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 10px; margin-right: 6px; border: 1px solid var(--line); }
+  .li-badge.vllm { color: var(--fabric); border-color: var(--fabric-dim); }
+  .li-badge.llamacpp { color: var(--accent); border-color: var(--accent); }
+  .li-act { display: flex; gap: 6px; flex-shrink: 0; }
+  .li-act button { padding: 6px 12px; font-size: 12px; }
+  .libitem { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+  .libitem:hover { border-color: var(--muted); }
+  .libitem.selected { border-color: var(--fabric); background: rgba(0,200,160,0.06); box-shadow: 0 0 0 1px var(--fabric-dim); }
+  .libitem.configured:not(.active) { border-color: var(--accent); background: rgba(220,160,40,0.04); }
+  .li-star { background: transparent; border: none; color: var(--accent); font-size: 15px; cursor: pointer; padding: 0 6px 0 0; line-height: 1; }
+  .li-star.on { color: var(--accent); }
+  .li-star:not(.on) { color: var(--dim); }
+  .lib-selbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; background: rgba(0,200,160,0.08); border: 1px solid var(--fabric-dim); border-radius: 10px; margin-bottom: 12px; }
+  .lsb-text { font-family: var(--mono); font-size: 13px; }
+  .lsb-actions { display: flex; gap: 8px; }
+  .lib-reload { background: var(--raised); border: 1px solid var(--line); }
+  .nas-haveit { color: var(--up); font-size: 12px; font-family: var(--mono); }
+  .nas-bring { background: var(--fabric); color: #04221b; border: none; font-weight: 600; }
+
+  /* engine logs */
+  .logpane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 26px; }
+  .logtabs { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+  .logtab { background: var(--raised); border: 1px solid var(--line); border-radius: 7px; padding: 5px 14px; font-size: 12.5px; color: var(--muted); }
+  .logtab.active { color: var(--fabric); border-color: var(--fabric-dim); }
+  .logfollow { margin-left: auto; font-size: 11.5px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+  .logview { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; color: var(--text); max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+
+  /* engines */
+  .engpane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 26px; }
+  .engrow { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 700px) { .engrow { grid-template-columns: 1fr; } }
+  .engcard { border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .engcard.eng-active { border-color: var(--up); background: rgba(80,200,120,0.05); }
+  .eng-name { font-family: var(--mono); font-size: 15px; font-weight: 600; }
+  .eng-role { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .eng-state { font-family: var(--mono); font-size: 12px; margin-top: 8px; color: var(--dim); }
+  .eng-state.live { color: var(--up); }
+  .ll-title { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .ll-inputs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .ll-inputs input { flex: 1; min-width: 200px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: 12.5px; }
+  .ll-inputs button { padding: 8px 18px; }
+
+  /* history + cost */
+  .histbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+  .histwin { display: flex; gap: 6px; }
+  .hwin { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; font-size: 12.5px; color: var(--muted); }
+  .hwin.active { color: var(--fabric); border-color: var(--fabric-dim); }
+  .costcards { display: flex; gap: 10px; flex-wrap: wrap; }
+  .costcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; }
+  .costcard .cc-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); }
+  .costcard .cc-val { font-family: var(--mono); font-size: 17px; font-weight: 600; color: var(--up); }
+  .costcard .cc-sub { font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 26px; }
+  @media (max-width: 760px) { .charts { grid-template-columns: 1fr; } }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .chart-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .chart svg { width: 100%; height: 140px; display: block; }
+  .chart .ln-head { fill: none; stroke: var(--fabric); stroke-width: 2; }
+  .chart .ln-worker { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 4 3; }
+  .chart .ln-single { fill: none; stroke: var(--fabric); stroke-width: 2; }
+  .chart .ar-head { fill: var(--fabric); opacity: 0.08; }
+  .chart .ax { stroke: var(--line); stroke-width: 1; }
+  .chart .axlabel { fill: var(--dim); font-size: 10px; font-family: var(--mono); }
+
+  /* download progress banner */
+  .dlbanner { background: var(--panel); border: 1px solid var(--fabric-dim); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+  .dl-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .dl-head span:first-child { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+  .dl-head span:last-child { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fabric); }
+  .dl-track { height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .dl-fill { height: 100%; width: 0%; background: var(--fabric); border-radius: 6px; transition: width .5s ease; }
+  .dl-fill.error { background: var(--err); }
+  .dl-meta { display: flex; justify-content: space-between; margin-top: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .dl-right { display: flex; align-items: center; gap: 10px; }
+  .dl-x { background: transparent; border: none; color: var(--dim); font-size: 18px; line-height: 1; padding: 0 4px; cursor: pointer; }
+  .dl-x:hover { color: var(--text); border: none; }
+  .dlbanner.state-ready { border-color: var(--up); }
+  .dlbanner.state-ready .dl-fill { background: var(--up); }
+  .dlbanner.state-ready #dl-status { color: var(--up); }
+  .dlbanner.state-error { border-color: var(--err); }
+  .dlbanner.state-error .dl-fill { background: var(--err); }
+  .dlbanner.state-error #dl-status { color: var(--err); }
+  .dl-cancel { background: transparent; border: 1px solid var(--err); color: var(--err); border-radius: 6px; padding: 3px 12px; font-size: 11.5px; cursor: pointer; margin-right: 4px; }
+  .dl-cancel:hover { background: rgba(240,90,90,0.12); }
+  .dl-fill.indet { width: 35% !important; animation: indet 1.3s ease-in-out infinite; }
+  @keyframes indet { 0% { margin-left: 0; } 50% { margin-left: 65%; } 100% { margin-left: 0; } }
+
+  /* expanded node telemetry readouts */
+  .nstat-extra { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .ne { text-align: center; }
+  .ne .ne-val { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--text); }
+  .ne .ne-lbl { font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 2px; }
+  .mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 15px; display: flex; flex-direction: column; gap: 8px; }
+  .mcard.active { border-color: var(--up); box-shadow: inset 0 0 0 1px var(--up); }
+  .mcard .mid { font-family: var(--mono); font-size: 13px; font-weight: 600; word-break: break-all; }
+  .mcard .mmeta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .tag { font-size: 10.5px; font-family: var(--mono); padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.single { color: var(--up); border-color: var(--up); }
+  .tag.cluster { color: var(--fabric); border-color: var(--fabric-dim); }
+  .tag.toobig { color: var(--err); border-color: #5a2a28; }
+  .tag.unknown { color: var(--dim); }
+  .tag.cached { color: var(--accent); border-color: var(--accent); }
+  .tag.gated { color: var(--warn); border-color: var(--warn); }
+  .mcard .mnote { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+  .mcard .mact { display: flex; gap: 8px; margin-top: 2px; }
+  .mcard .mact button { padding: 7px 14px; font-size: 12.5px; }
+  .searchrow { display: flex; gap: 8px; margin-bottom: 8px; }
+  .searchrow input { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: 13px; padding: 9px 11px; }
+  .searchrow input:focus-visible { outline: 2px solid var(--accent); border-color: var(--accent); }
+  .testresult { background: #070b0f; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-top: 12px; }
+  .testresult .tr-stats { display: flex; gap: 16px; margin-bottom: 10px; font-family: var(--mono); font-size: 12px; }
+  .testresult .tr-stats b { color: var(--fabric); }
+  .testresult .tr-text { font-size: 13.5px; line-height: 1.5; color: var(--text); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="title"><b>GX10</b> cluster control</div>
+    <div class="clock" id="clock"></div>
+  </header>
+
+  <!-- signature: live fabric link between the two boxes -->
+  <section class="fabric" aria-label="Cluster fabric status">
+    <div class="node">
+      <div class="role">Head node</div>
+      <div class="name" id="head-name">myspark</div>
+      <div class="ip" id="head-ip">192.168.100.10</div>
+      <div class="chip"><span class="dot" id="head-dot"></span><span id="head-iface">enp1s0f1np1</span></div>
+    </div>
+    <div class="link" id="link">
+      <div class="wire"></div>
+      <div class="speed" id="link-speed">ConnectX-7</div>
+    </div>
+    <div class="node">
+      <div class="role">Worker node</div>
+      <div class="name" id="worker-name">myspark2</div>
+      <div class="ip" id="worker-ip">192.168.100.11</div>
+      <div class="chip"><span class="dot" id="worker-dot"></span><span id="worker-host">myspark2</span></div>
+    </div>
+  </section>
+
+  <div class="bar">
+    <div class="verdict" aria-live="polite">
+      <span class="big dot" id="verdict-dot"></span>
+      <span id="verdict-text">Checking cluster...</span>
+    </div>
+    <div class="actions">
+      <button class="primary" id="btn-start" aria-label="Start cluster">Start cluster</button>
+      <button class="danger" id="btn-stop" aria-label="Stop cluster">Stop</button>
+      <button id="btn-optimize" aria-label="Optimize and fix configuration">Optimize &amp; fix</button>
+    </div>
+  </div>
+
+  <nav class="tabbar" role="tablist">
+    <button class="tab active" data-tab="monitor" role="tab">Monitor</button>
+    <button class="tab" data-tab="serve" role="tab">Serve</button>
+    <button class="tab" data-tab="manage" role="tab">Manage</button>
+    <div class="engine-toggle" id="engine-toggle" title="Active engine">
+      <span class="et-label">Engine</span>
+      <button class="et-opt active" data-engine="auto">Auto</button>
+      <button class="et-opt" data-engine="vllm">vLLM</button>
+      <button class="et-opt" data-engine="llamacpp">llama.cpp</button>
+    </div>
+  </nav>
+
+  <div class="tabpane active" id="pane-monitor">
+  <div class="now-serving" id="now-serving">
+    <span class="ns-dot" id="ns-dot"></span>
+    <span id="ns-summary">Checking what's serving...</span>
+  </div>
+
+  <h2 class="sec">Live telemetry</h2>
+  <div class="telemetry" id="telemetry">
+    <div class="metric"><div class="mlabel">Throughput</div><div class="mval" id="m-tps">--</div><div class="munit">tokens/sec</div></div>
+    <div class="metric"><div class="mlabel">In flight</div><div class="mval" id="m-running">--</div><div class="munit">requests</div></div>
+    <div class="metric"><div class="mlabel">Queued</div><div class="mval" id="m-waiting">--</div><div class="munit">waiting</div></div>
+    <div class="metric"><div class="mlabel">Generated</div><div class="mval" id="m-total">--</div><div class="munit">tokens total</div></div>
+  </div>
+  <div class="nodestats" id="nodestats">
+    <div class="nstat">
+      <div class="nstat-head"><span id="ns-head-name">myspark</span><span class="nstat-role">head</span></div>
+      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-head-gpu"></div></div><div class="gpct" id="ns-head-gpu-pct">--</div></div>
+      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-head-mem"></div></div><div class="gpct" id="ns-head-mem-pct">--</div></div>
+      <div class="nstat-extra">
+        <div class="ne"><div class="ne-val" id="ns-head-power">--</div><div class="ne-lbl">Power W</div></div>
+        <div class="ne"><div class="ne-val" id="ns-head-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+        <div class="ne"><div class="ne-val" id="ns-head-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+      </div>
+    </div>
+    <div class="nstat">
+      <div class="nstat-head"><span id="ns-worker-name">myspark2</span><span class="nstat-role">worker</span></div>
+      <div class="gauge"><div class="gauge-label">GPU</div><div class="gbar"><div class="gfill" id="ns-worker-gpu"></div></div><div class="gpct" id="ns-worker-gpu-pct">--</div></div>
+      <div class="gauge"><div class="gauge-label">Memory</div><div class="gbar"><div class="gfill mem" id="ns-worker-mem"></div></div><div class="gpct" id="ns-worker-mem-pct">--</div></div>
+      <div class="nstat-extra">
+        <div class="ne"><div class="ne-val" id="ns-worker-power">--</div><div class="ne-lbl">Power W</div></div>
+        <div class="ne"><div class="ne-val" id="ns-worker-temp">--</div><div class="ne-lbl">Temp &deg;C</div></div>
+        <div class="ne"><div class="ne-val" id="ns-worker-clk">--</div><div class="ne-lbl">SM MHz</div></div>
+      </div>
+    </div>
+  </div>
+
+  </div><!-- /pane-monitor telemetry part; history moves here via CSS order -->
+
+  <div class="tabpane" id="pane-manage">
+  <h2 class="sec">Configuration checks</h2>
+  <div class="grid" id="checks"></div>
+
+  <div class="columns">
+    <div>
+      <h2 class="sec">Serving config</h2>
+      <div class="pane">
+        <div class="field">
+          <label for="f-model">Model</label>
+          <input id="f-model" type="text" spellcheck="false" />
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="f-tp">Tensor parallel</label>
+            <input id="f-tp" type="number" min="1" max="2" />
+          </div>
+          <div class="field">
+            <label for="f-util">GPU mem util</label>
+            <input id="f-util" type="number" step="0.01" min="0.4" max="0.95" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-len">Max model length</label>
+          <input id="f-len" type="number" step="1024" />
+        </div>
+        <div class="actions">
+          <button id="btn-save" aria-label="Save serving config">Save config</button>
+          <button id="btn-reload" aria-label="Reload model now">Reload model now</button>
+          <button id="btn-unload" class="danger" aria-label="Unload model">Unload</button>
+          <button id="btn-rdma" aria-label="Check RDMA transport">Check RDMA</button>
+        </div>
+        <p class="hint">Save writes to cluster.env and applies on next start. Reload swaps the model in the running cluster without a full restart.</p>
+      </div>
+    </div>
+
+    <div>
+      <h2 class="sec">Activity</h2>
+      <div class="console" id="console" aria-live="polite"></div>
+      <div class="actions" style="margin-top:10px;">
+        <button id="btn-vllm-logs" aria-label="Show vLLM logs">Show vLLM logs</button>
+        <button id="btn-clear" aria-label="Clear activity view">Clear view</button>
+      </div>
+    </div>
+  </div>
+
+  <h2 class="sec">vLLM version &amp; image</h2>
+  <div class="imgpane">
+    <div class="imgcur" id="img-current">Checking version...</div>
+    <div class="imgbanner hidden" id="img-banner">
+      <div class="dl-head"><span id="img-status">working</span></div>
+      <div class="dl-track"><div class="dl-fill" id="img-fill"></div></div>
+      <div class="dl-meta"><span id="img-detail"></span></div>
+    </div>
+    <div id="img-candidates"></div>
+    <div id="img-locals"></div>
+    <p class="hint">Updating pulls a newer NVIDIA-validated image (~19GB per node) and rebuilds the Ray layer, keeping your current image so you can roll back. Switching requires a cluster relaunch (Stop then Start). Newer images may add support for the latest model formats (e.g. NVFP4).</p>
+  </div>
+
+  </div><!-- /pane-manage -->
+
+  <div class="tabpane active" id="pane-monitor-history">
+  <h2 class="sec">History &amp; cost</h2>
+  <div class="histbar">
+    <div class="histwin" role="tablist">
+      <button class="hwin active" data-win="hour">Hour</button>
+      <button class="hwin" data-win="day">Day</button>
+      <button class="hwin" data-win="week">Week</button>
+    </div>
+    <div class="costcards" id="cost-cards"></div>
+  </div>
+  <div class="charts">
+    <div class="chart"><div class="chart-title">Throughput (tokens/sec)</div><svg id="chart-tps" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Temperature (&deg;C)</div><svg id="chart-temp" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Power draw (W)</div><svg id="chart-power" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Memory used (GB)</div><svg id="chart-mem" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+  </div>
+  </div><!-- /pane-monitor-history -->
+
+  <div class="tabpane" id="pane-serve">
+  <h2 class="sec">Engines</h2>
+  <div class="engpane">
+    <div class="engrow">
+      <div class="engcard" id="eng-vllm">
+        <div class="eng-name">vLLM</div>
+        <div class="eng-role">multi-node cluster · safetensors</div>
+        <div class="eng-state" id="eng-vllm-state">checking...</div>
+      </div>
+      <div class="engcard" id="eng-llama">
+        <div class="eng-name">llama.cpp</div>
+        <div class="eng-role">single-node · GGUF</div>
+        <div class="eng-state" id="eng-llama-state">checking...</div>
+      </div>
+    </div>
+    <div class="llama-load">
+      <div class="ll-title">Load a GGUF model on llama.cpp</div>
+      <div class="ll-inputs">
+        <input id="ll-repo" type="text" placeholder="repo, e.g. unsloth/Qwen3.6-35B-A3B-GGUF" aria-label="GGUF repo" />
+        <input id="ll-file" type="text" placeholder="file, e.g. Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" aria-label="GGUF file" />
+        <button id="ll-load" aria-label="Load on llama.cpp">Load</button>
+      </div>
+      <p class="hint">For GGUF models vLLM can't run (Qwen3.6, newest quants). Runs single-node on one GB10. Stops the vLLM model if memory is tight; they share the box.</p>
+      <button id="engine-stop" class="danger hidden" aria-label="Stop active engine">Stop</button>
+    </div>
+  </div>
+
+  <h2 class="sec">Engine logs</h2>
+  <div class="logpane">
+    <div class="logtabs" role="tablist">
+      <button class="logtab active" data-log="vllm" role="tab">vLLM</button>
+      <button class="logtab" data-log="llamacpp" role="tab">llama.cpp</button>
+      <label class="logfollow"><input type="checkbox" id="log-follow" checked /> Auto-refresh</label>
+    </div>
+    <pre class="logview" id="engine-logview" aria-live="polite">Select an engine to view logs.</pre>
+  </div>
+
+  <h2 class="sec">Models</h2>
+  <div class="dlbanner hidden" id="dl-banner">
+    <div class="dl-head">
+      <span id="dl-model">model</span>
+      <span class="dl-right">
+        <span id="dl-status">working</span>
+        <button class="dl-cancel" id="dl-cancel" aria-label="Cancel load">Cancel</button>
+        <button class="dl-x" id="dl-dismiss" aria-label="Dismiss">&times;</button>
+      </span>
+    </div>
+    <div class="dl-track"><div class="dl-fill" id="dl-fill"></div></div>
+    <div class="dl-meta"><span id="dl-detail"></span><span id="dl-speed"></span></div>
+  </div>
+  <div class="modeltabs" role="tablist">
+    <button class="mtab active" id="tab-curated" role="tab">Favorites</button>
+    <button class="mtab" id="tab-search" role="tab">Discover</button>
+    <button class="mtab" id="tab-library" role="tab">Library</button>
+    <button class="mtab" id="tab-nas" role="tab">NAS Archive</button>
+    <button class="mtab" id="tab-test" role="tab">Test</button>
+  </div>
+
+  <div class="mpane" id="pane-curated">
+    <p class="hint" id="budget-line">Loading model budget...</p>
+    <div class="mlist" id="curated-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-search">
+    <div class="searchrow">
+      <input id="search-input" type="text" placeholder="Search Hugging Face, e.g. qwen coder, llama 70b" spellcheck="false" />
+      <button id="search-btn" aria-label="Search models">Search</button>
+    </div>
+    <p class="hint">Footprint estimates are rough (parsed from the model name). Always check the model card for exact size and license.</p>
+    <div class="mlist" id="search-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-library">
+    <div class="storage-bar" id="storage-bar">
+      <div class="sb-info"><span id="sb-text">Checking storage...</span></div>
+      <div class="sb-track"><div class="sb-fill" id="sb-fill"></div></div>
+      <div class="sb-path">
+        <input id="sb-path-input" type="text" placeholder="cache path, e.g. /home/nealasmothers/hf-cache" aria-label="Cache path" />
+        <button id="sb-path-save" aria-label="Set cache path">Set path</button>
+      </div>
+    </div>
+    <div class="lib-selbar hidden" id="lib-selbar">
+      <span class="lsb-text">Selected: <strong id="lib-selbar-name"></strong></span>
+      <div class="lsb-actions">
+        <button class="primary" id="lib-selbar-load" aria-label="Load selected model">Load selected</button>
+        <button id="lib-selbar-clear" aria-label="Clear selection">Clear</button>
+      </div>
+    </div>
+    <div class="mlist" id="library-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-nas">
+    <div class="storage-bar" id="nas-bar">
+      <div class="sb-info"><span id="nas-text">Checking NAS...</span></div>
+      <div class="sb-path">
+        <input id="nas-path-input" type="text" placeholder="NAS mount path, e.g. /mnt/nas/models" aria-label="NAS path" />
+        <button id="nas-path-save" aria-label="Set NAS path">Set NAS path</button>
+      </div>
+      <p class="hint">Archive a big library on the NAS. Bring a model to the cluster (local NVMe) the first time you need it; after that it loads fast from local. Mount the NAS on the box first (NFS recommended).</p>
+    </div>
+    <div class="mlist" id="nas-list"></div>
+  </div>
+
+  <div class="mpane hidden" id="pane-test">
+    <div class="field">
+      <label for="test-prompt">Prompt</label>
+      <input id="test-prompt" type="text" value="In one sentence, what is offshore vessel logistics?" spellcheck="false" />
+    </div>
+    <div class="actions">
+      <button id="test-btn" aria-label="Send test prompt">Send to active model</button>
+    </div>
+    <div class="testresult hidden" id="test-result"></div>
+  </div>
+  </div><!-- /pane-serve -->
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = async (path, method = "GET", body = null) => {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opt.body = JSON.stringify(body);
+  const res = await fetch(path, opt);
+  return res.json();
+};
+const toast = (msg) => {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 3200);
+};
+
+const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }[status] || "");
+
+let configLoaded = false;
+
+const renderStatus = (s) => {
+  // nodes
+  $("head-name").textContent = "myspark";
+  $("head-ip").textContent = s.nodes.head.ip;
+  $("head-iface").textContent = s.nodes.head.iface || "cx7";
+  $("worker-ip").textContent = s.nodes.worker.ip;
+  $("worker-host").textContent = s.nodes.worker.host;
+
+  // map checks by label
+  const by = {};
+  s.checks.forEach((c) => (by[c.label] = c));
+
+  const link = by["ConnectX-7 link"] || {};
+  const fabric = by["Fabric reachability"] || {};
+  const linkEl = $("link");
+  linkEl.className = "link";
+  $("head-dot").className = "dot " + dotClass(link.status);
+  $("worker-dot").className = "dot " + dotClass(fabric.status);
+  if (link.status === "ok" && fabric.status === "ok") { linkEl.classList.add("live"); $("link-speed").textContent = "200 Gb/s active"; }
+  else if (link.status === "error" || fabric.status === "error") { linkEl.classList.add("down"); $("link-speed").textContent = "link down"; }
+  else { linkEl.classList.add("degraded"); $("link-speed").textContent = "degraded"; }
+
+  // verdict
+  const vd = $("verdict-dot"), vt = $("verdict-text");
+  vd.className = "big dot " + dotClass(s.overall);
+  if (s.action) vt.innerHTML = `<span class="spin"></span>${s.action[0].toUpperCase() + s.action.slice(1)} the cluster...`;
+  else if (s.overall === "ok" && s.running) vt.textContent = "Cluster healthy and serving.";
+  else if (s.overall === "ok") vt.textContent = "Configuration good. Cluster idle.";
+  else if (s.overall === "warn") vt.textContent = "Running with warnings. See checks below.";
+  else vt.textContent = "Problems found. Review checks or run Optimize.";
+
+  // buttons reflect action state
+  const busy = !!s.action;
+  $("btn-start").disabled = busy || s.running;
+  $("btn-stop").disabled = busy || !s.running;
+  $("btn-optimize").disabled = busy;
+
+  // check cards
+  const grid = $("checks");
+  grid.innerHTML = "";
+  s.checks.forEach((c) => {
+    const div = document.createElement("div");
+    div.className = "card " + c.status;
+    div.innerHTML = `<div class="label"><span class="dot ${dotClass(c.status)}"></span>${c.label}</div><div class="detail">${c.detail}</div>`;
+    grid.appendChild(div);
+  });
+
+  // config fields (only fill once so typing isn't clobbered)
+  if (!configLoaded && s.config) {
+    $("f-model").value = s.config.MODEL || "";
+    $("f-tp").value = s.config.TENSOR_PARALLEL || "";
+    $("f-util").value = s.config.GPU_MEM_UTIL || "";
+    $("f-len").value = s.config.MAX_MODEL_LEN || "";
+    configLoaded = true;
+  }
+};
+
+const pollStatus = async () => {
+  try { renderStatus(await api("/api/status")); }
+  catch (e) { $("verdict-text").textContent = "Panel cannot reach the backend."; }
+};
+
+// console can show either the activity feed or live vLLM logs.
+// pollActivity must not clobber the vLLM view, and the vLLM view should refresh itself.
+let consoleMode = "activity"; // or "vllm"
+
+const renderActivity = (lines) => {
+  if (consoleMode !== "activity") return;  // don't overwrite the vLLM log view
+  const c = $("console");
+  const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
+  c.innerHTML = lines.map((x) => {
+    let cls = "";
+    if (x.line.includes("[error]") || x.line.toLowerCase().includes("fail")) cls = "l-error";
+    else if (x.line.includes("[optimize]")) cls = "l-optimize";
+    else if (x.line.includes("[model]") || x.line.includes("[config]")) cls = "l-model";
+    return `<div class="${cls}"><span class="t">${x.t}</span>${x.line.replace(/</g, "&lt;")}</div>`;
+  }).join("");
+  if (atBottom) c.scrollTop = c.scrollHeight;
+};
+
+const renderVllmLogs = async () => {
+  const c = $("console");
+  const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 60;
+  try {
+    const r = await api("/api/logs");
+    c.innerHTML = `<div class="t">vLLM log tail · live</div>` +
+      r.log.replace(/</g, "&lt;").split("\n").map((l) => `<div>${l}</div>`).join("");
+    if (atBottom) c.scrollTop = c.scrollHeight;
+  } catch (e) {}
+};
+
+const pollActivity = async () => {
+  if (consoleMode === "vllm") { renderVllmLogs(); return; }
+  try { renderActivity((await api("/api/activity")).lines); } catch (e) {}
+};
+
+// actions
+$("btn-start").onclick = async () => { toast((await api("/api/start", "POST")).detail); pollStatus(); };
+$("btn-stop").onclick = async () => { toast((await api("/api/stop", "POST")).detail); pollStatus(); };
+$("btn-optimize").onclick = async () => {
+  $("btn-optimize").disabled = true;
+  toast("Running checks and fixes...");
+  const r = await api("/api/optimize", "POST");
+  const fixed = r.results.filter((x) => x.status === "fixed").length;
+  toast(`Optimize done. ${fixed} item(s) fixed.`);
+  pollActivity(); pollStatus();
+};
+$("btn-rdma").onclick = async () => {
+  toast("Checking NCCL transport...");
+  toast((await api("/api/rdma-check", "POST")).detail);
+  pollActivity();
+};
+$("btn-save").onclick = async () => {
+  const body = {
+    MODEL: $("f-model").value.trim(),
+    TENSOR_PARALLEL: $("f-tp").value,
+    GPU_MEM_UTIL: $("f-util").value,
+    MAX_MODEL_LEN: $("f-len").value,
+  };
+  toast((await api("/api/config", "POST", body)).detail);
+};
+$("btn-reload").onclick = async () => {
+  const model = $("f-model").value.trim();
+  if (!model) return toast("Enter a model first.");
+  toast((await api("/api/model", "POST", { model })).detail);
+  pollActivity();
+};
+$("btn-vllm-logs").onclick = async () => {
+  if (consoleMode === "vllm") {
+    consoleMode = "activity";
+    $("btn-vllm-logs").textContent = "Show vLLM logs";
+    pollActivity();
+  } else {
+    consoleMode = "vllm";
+    $("btn-vllm-logs").textContent = "Show activity";
+    renderVllmLogs();
+  }
+};
+$("btn-clear").onclick = () => { if (consoleMode === "activity") $("console").innerHTML = ""; };
+
+// ---------- Models section ----------
+const fitTag = (m) => {
+  const map = { single: "single node", cluster: "needs both nodes", toobig: "too large", unknown: "size unknown" };
+  const fp = m.footprint_gb ? ` ~${m.footprint_gb}GB` : "";
+  return `<span class="tag ${m.fit}">${map[m.fit] || m.fit}${fp}</span>`;
+};
+
+const modelCard = (m, opts = {}) => {
+  const tags = [fitTag(m)];
+  if (m.cached) tags.push('<span class="tag cached">cached</span>');
+  if (m.gated) tags.push('<span class="tag gated">gated</span>');
+  if (opts.downloads != null) tags.push(`<span class="tag">${fmtNum(m.downloads)} downloads</span>`);
+  const canLoad = m.fit !== "toobig";
+  const loadBtn = m.active
+    ? '<span class="tag single">active</span>'
+    : (canLoad ? `<button data-model="${m.id}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "");
+  const note = m.note ? `<div class="mnote">${m.note}</div>` : "";
+  return `<div class="mcard ${m.active ? "active" : ""}">
+    <div class="mid">${m.id}</div>
+    <div class="mmeta">${tags.join("")}</div>
+    ${note}
+    <div class="mact">${loadBtn}</div>
+  </div>`;
+};
+
+const wireLoadButtons = (container) => {
+  container.querySelectorAll(".load-model").forEach((btn) => {
+    btn.onclick = async () => {
+      const model = btn.getAttribute("data-model");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Checking...";
+      // pre-load check: tell the user what will happen
+      let chk;
+      try { chk = await api("/api/model/preload-check", "POST", { model }); }
+      catch (e) { chk = null; }
+      btn.disabled = false; btn.textContent = original;
+      if (chk) {
+        const lines = [];
+        lines.push(`Engine: ${chk.engine === "llamacpp" ? "llama.cpp (single node)" : "vLLM (cluster)"}`);
+        lines.push(chk.cached ? "Already cached, loads without downloading." : "Not cached, will download first.");
+        if (chk.currently_serving) lines.push(`Replaces currently serving: ${chk.currently_serving}`);
+        chk.warnings.forEach((w) => lines.push("⚠ " + w));
+        const proceed = confirm(`Load ${model}?\n\n${lines.join("\n")}\n\n${chk.ok_to_load ? "Proceed?" : "This will likely fail. Try anyway?"}`);
+        if (!proceed) return;
+      }
+      btn.disabled = true; btn.textContent = "Starting...";
+      const loadBody = { model };
+      if (engineOverride !== "auto") loadBody.engine = engineOverride;
+      try {
+        const r = await api("/api/model", "POST", loadBody);
+        toast(r.detail);
+      } catch (e) {
+        toast("Load failed: " + e.message);
+      }
+      // always restore the button so it can be used again (e.g. after a later delete)
+      btn.disabled = false; btn.textContent = original;
+      pollDownload(); pollActivity();
+      // refresh discover so cached/active state is current
+      setTimeout(() => { if (typeof runSearch === "function" && $("search-input") && $("search-input").value) runSearch(); }, 1500);
+    };
+  });
+};
+
+// Generic paginator: renders a slice of `items` into `listId`, with controls.
+// State is stored per-list so each tab pages independently.
+const PAGE_SIZE = 9;
+const pageState = {};
+
+const renderPaged = (listId, items, cardFn, emptyMsg, opts = {}) => {
+  const list = $(listId);
+  if (!items.length) { list.innerHTML = `<p class="hint">${emptyMsg}</p>`; return; }
+  if (pageState[listId] == null) pageState[listId] = 0;
+  const pages = Math.ceil(items.length / PAGE_SIZE);
+  if (pageState[listId] >= pages) pageState[listId] = pages - 1;
+  const page = pageState[listId];
+  const slice = items.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+  const cards = slice.map((m) => cardFn(m)).join("");
+  const controls = pages > 1 ? `
+    <div class="pager">
+      <button class="pg-prev" ${page === 0 ? "disabled" : ""} aria-label="Previous page">Previous</button>
+      <span class="pg-info">Page ${page + 1} of ${pages} · ${items.length} models</span>
+      <button class="pg-next" ${page >= pages - 1 ? "disabled" : ""} aria-label="Next page">Next</button>
+    </div>` : `<div class="pager"><span class="pg-info">${items.length} model${items.length === 1 ? "" : "s"}</span></div>`;
+
+  list.innerHTML = `<div class="mlist-grid">${cards}</div>${controls}`;
+  wireLoadButtons(list);
+  const prev = list.querySelector(".pg-prev"), next = list.querySelector(".pg-next");
+  if (prev) prev.onclick = () => { pageState[listId] = Math.max(0, page - 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
+  if (next) next.onclick = () => { pageState[listId] = Math.min(pages - 1, page + 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
+};
+
+const loadCurated = async () => {
+  const r = await api("/api/models/curated");
+  const b = r.budget;
+  $("budget-line").textContent = `Pooled memory ~${b.pooled_gb}GB across both nodes, ~${b.usable_gb}GB usable. Single node holds ~${b.single_node_gb}GB. Estimates are approximate.`;
+  pageState["curated-list"] = 0;
+  renderPaged("curated-list", r.models, (m) => modelCard(m), "No favorites configured.");
+};
+
+let librarySelected = null;
+let favorites = [];
+const saveFavorites = async () => {
+  // optimistic UI already updated `favorites`; persist via toggle is handled per-click
+};
+
+const loadLibrary = async () => {
+  const r = await api("/api/library");
+  favorites = r.favorites || favorites;
+  // storage bar
+  const s = r.storage || {};
+  const disk = s.disk || {};
+  if (disk.used_pct != null) {
+    $("sb-text").textContent = `Models: ${s.models_gb}GB · Disk ${disk.free_gb}GB free of ${disk.total_gb}GB (${disk.used_pct}% used) · ${s.cache_path}`;
+    const fill = $("sb-fill");
+    fill.style.width = disk.used_pct + "%";
+    fill.className = "sb-fill" + (disk.used_pct > 90 ? " crit" : disk.used_pct > 75 ? " warn" : "");
+  } else {
+    $("sb-text").textContent = `Models: ${s.models_gb || 0}GB · ${s.cache_path || "cache"}`;
+  }
+  if (!$("sb-path-input").value) $("sb-path-input").value = s.cache_path || "";
+
+  // model list with selection + full actions
+  const list = $("library-list");
+  if (!r.models.length) {
+    list.innerHTML = '<p class="hint">No models cached yet. Find and load one from Favorites or Discover.</p>';
+    return;
+  }
+  list.innerHTML = r.models.map((m) => {
+    const eng = m.engine === "llamacpp" ? "llamacpp" : "vllm";
+    const engLabel = eng === "llamacpp" ? "llama.cpp" : "vLLM";
+    const fav = favorites.includes(m.id);
+    const selected = librarySelected === m.id;
+    const stateLabel = m.active ? " · active" : (m.configured ? " · configured (not serving)" : "");
+    return `<div class="libitem ${m.active ? "active" : ""} ${m.configured ? "configured" : ""} ${selected ? "selected" : ""}" data-model="${m.id}" data-engine="${eng}" tabindex="0" role="button" aria-pressed="${selected}">
+      <div class="li-left">
+        <div class="li-name">
+          <button class="li-star ${fav ? "on" : ""}" data-model="${m.id}" aria-label="${fav ? "Unfavorite" : "Favorite"}" title="${fav ? "Remove from favorites" : "Add to favorites"}">${fav ? "★" : "☆"}</button>
+          ${m.id}
+        </div>
+        <div class="li-meta"><span class="li-badge ${eng}">${engLabel}</span>${m.size_gb || "?"}GB on disk${stateLabel}</div>
+      </div>
+      <div class="li-act">
+        ${m.active
+          ? `<button class="lib-reload" data-model="${m.id}" data-engine="${eng}">Reload</button>
+             <button class="lib-unload danger" data-model="${m.id}">Unload</button>
+             <button class="lib-del danger" data-model="${m.id}">Delete</button>`
+          : `<button class="lib-load" data-model="${m.id}" data-engine="${eng}">Load</button>
+             <button class="lib-del danger" data-model="${m.id}">Delete</button>`}
+      </div>
+    </div>`;
+  }).join("");
+
+  // selection action bar (acts on the selected model)
+  const selModel = librarySelected;
+  const bar = $("lib-selbar");
+  if (bar) {
+    if (selModel && r.models.some((m) => m.id === selModel && !m.active)) {
+      bar.classList.remove("hidden");
+      $("lib-selbar-name").textContent = selModel;
+    } else {
+      bar.classList.add("hidden");
+    }
+  }
+
+  // click a row to select/deselect (ignore clicks on buttons)
+  list.querySelectorAll(".libitem").forEach((row) => {
+    const selectRow = (e) => {
+      if (e.target.closest("button")) return; // buttons handle themselves
+      const model = row.getAttribute("data-model");
+      librarySelected = (librarySelected === model) ? null : model;
+      loadLibrary();
+    };
+    row.onclick = selectRow;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRow(e); } };
+  });
+
+  const doLoad = async (model, btn, label) => {
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = label;
+    const loadBody = { model };
+    if (engineOverride !== "auto") loadBody.engine = engineOverride;
+    try {
+      const r = await api("/api/model", "POST", loadBody);
+      toast(r.detail || "Load requested");
+    } catch (e) { toast("Load failed: " + e.message); }
+    btn.disabled = false; btn.textContent = orig;
+    pollDownload(); pollActivity();
+    setTimeout(() => { loadLibrary(); updateNowServing(); pollEngines(); }, 1500);
+  };
+
+  list.querySelectorAll(".lib-load").forEach((b) => {
+    b.onclick = () => doLoad(b.getAttribute("data-model"), b, "Loading...");
+  });
+  list.querySelectorAll(".lib-reload").forEach((b) => {
+    b.onclick = () => doLoad(b.getAttribute("data-model"), b, "Reloading...");
+  });
+  // unload (active model) - clears selection and active highlight on refresh
+  list.querySelectorAll(".lib-unload").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("Unload the active model? This frees memory and leaves the cluster idle.")) return;
+      b.disabled = true; b.textContent = "Unloading...";
+      try {
+        const r = await api("/api/model/unload", "POST");
+        toast(r.detail);
+      } catch (e) { toast("Unload failed: " + e.message); b.disabled = false; b.textContent = "Unload"; return; }
+      librarySelected = null;
+      // poll until the engine actually reports idle, so the row doesn't loop back to Unload
+      let tries = 0;
+      const confirmIdle = async () => {
+        tries++;
+        let a = {};
+        try { a = await api("/api/engine/active"); } catch (e) {}
+        if (!a.engine || tries >= 6) {
+          loadLibrary(); updateNowServing(); pollEngines();
+        } else {
+          setTimeout(confirmIdle, 800);
+        }
+      };
+      setTimeout(confirmIdle, 600);
+    };
+  });
+  // delete
+  list.querySelectorAll(".lib-del").forEach((b) => {
+    b.onclick = async () => {
+      const model = b.getAttribute("data-model");
+      if (!confirm(`Delete ${model} from disk? This frees the space but you'd re-download to use it again.`)) return;
+      b.disabled = true; b.textContent = "Deleting...";
+      try {
+        const r = await api("/api/library/delete", "POST", { model });
+        toast(r.detail);
+      } catch (e) { toast("Delete failed: " + e.message); }
+      if (librarySelected === model) librarySelected = null;
+      loadLibrary();
+    };
+  });
+  // favorite star
+  list.querySelectorAll(".li-star").forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      const model = b.getAttribute("data-model");
+      // optimistic toggle
+      if (favorites.includes(model)) {
+        favorites = favorites.filter((x) => x !== model);
+      } else {
+        favorites = [...favorites, model];
+      }
+      try {
+        const r = await api("/api/favorites/toggle", "POST", { model });
+        if (r.favorites) favorites = r.favorites;
+      } catch (err) { /* keep optimistic state */ }
+      loadLibrary();
+    };
+  });
+};
+
+$("sb-path-save").onclick = async () => {
+  const path = $("sb-path-input").value.trim();
+  if (!path) { toast("Enter a cache path."); return; }
+  if (!confirm(`Set cache path to ${path}? Applies on next cluster start. Existing models stay where they are.`)) return;
+  const r = await api("/api/storage/path", "POST", { path });
+  toast(r.detail);
+};
+
+$("lib-selbar-load").onclick = async () => {
+  if (!librarySelected) return;
+  const model = librarySelected;
+  const btn = $("lib-selbar-load");
+  btn.disabled = true; btn.textContent = "Loading...";
+  const loadBody = { model };
+  if (engineOverride !== "auto") loadBody.engine = engineOverride;
+  try {
+    const r = await api("/api/model", "POST", loadBody);
+    toast(r.detail || "Load requested");
+  } catch (e) { toast("Load failed: " + e.message); }
+  btn.disabled = false; btn.textContent = "Load selected";
+  librarySelected = null;
+  pollDownload(); pollActivity();
+  setTimeout(() => { loadLibrary(); updateNowServing(); pollEngines(); }, 1500);
+};
+
+$("lib-selbar-clear").onclick = () => { librarySelected = null; loadLibrary(); };
+
+const runSearch = async () => {
+  const q = $("search-input").value.trim();
+  if (!q) return;
+  $("search-list").innerHTML = '<p class="hint">Searching Hugging Face...</p>';
+  const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
+  pageState["search-list"] = 0;
+  renderPaged("search-list", r.results, (m) => modelCard(m, { downloads: m.downloads }), "No results. Try different terms.");
+};
+$("search-btn").onclick = runSearch;
+$("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+$("test-btn").onclick = async () => {
+  const prompt = $("test-prompt").value.trim();
+  if (!prompt) return toast("Enter a prompt.");
+  const btn = $("test-btn"); btn.disabled = true; btn.textContent = "Running...";
+  const res = $("test-result"); res.classList.remove("hidden");
+  res.innerHTML = '<p class="hint">Waiting for the model...</p>';
+  const r = await api("/api/models/test", "POST", { prompt, max_tokens: 128 });
+  btn.disabled = false; btn.textContent = "Send to active model";
+  if (!r.ok) { res.innerHTML = `<p class="hint">${r.detail}</p>`; return; }
+  res.innerHTML = `<div class="tr-stats"><span><b>${r.tps}</b> tok/s</span><span><b>${r.tokens}</b> tokens</span><span><b>${r.seconds}</b>s</span><span>${r.model}</span></div><div class="tr-text">${r.text.replace(/</g, "&lt;")}</div>`;
+};
+
+// tab switching
+const tabs = { curated: "pane-curated", search: "pane-search", library: "pane-library", nas: "pane-nas", test: "pane-test" };
+Object.keys(tabs).forEach((k) => {
+  $(`tab-${k}`).onclick = () => {
+    Object.keys(tabs).forEach((j) => {
+      $(`tab-${j}`).classList.toggle("active", j === k);
+      $(tabs[j]).classList.toggle("hidden", j !== k);
+    });
+    if (k === "library") loadLibrary();
+    if (k === "nas") loadNas();
+  };
+});
+
+// ---------- NAS archive ----------
+const loadNas = async () => {
+  let r;
+  try { r = await api("/api/nas/models"); } catch (e) { return; }
+  const st = r.status || {};
+  if ($("nas-path-input") && !$("nas-path-input").value) $("nas-path-input").value = st.path || "";
+  if (!st.configured) {
+    $("nas-text").textContent = "No NAS configured. Set a mount path below to enable the archive.";
+    $("nas-list").innerHTML = '<p class="hint">Mount your NAS on the box (NFS recommended), then set the path here.</p>';
+    return;
+  }
+  if (!st.mounted) {
+    $("nas-text").textContent = `NAS path ${st.path} is not reachable. Is it mounted?`;
+    $("nas-list").innerHTML = '<p class="hint">The path is set but not readable. Check the mount on the box.</p>';
+    return;
+  }
+  const d = st.disk || {};
+  $("nas-text").textContent = `NAS: ${st.path}` + (d.free_gb != null ? ` · ${d.free_gb}GB free of ${d.total_gb}GB` : "");
+  const models = r.models || [];
+  if (!models.length) {
+    $("nas-list").innerHTML = '<p class="hint">No models found on the NAS yet. Download some to the archive, or copy model folders there.</p>';
+    return;
+  }
+  $("nas-list").innerHTML = models.map((m) => {
+    const kindLabel = m.kind === "gguf" ? "GGUF" : "safetensors";
+    return `<div class="libitem">
+      <div class="li-left">
+        <div class="li-name">${m.id}</div>
+        <div class="li-meta"><span class="li-badge ${m.kind === "gguf" ? "llamacpp" : "vllm"}">${kindLabel}</span>${m.size_gb || "?"}GB on NAS${m.local ? " · already local" : ""}</div>
+      </div>
+      <div class="li-act">
+        ${m.local
+          ? `<span class="nas-haveit">On cluster</span>`
+          : `<button class="nas-bring" data-model="${m.id}">Bring to cluster</button>`}
+      </div>
+    </div>`;
+  }).join("");
+  $("nas-list").querySelectorAll(".nas-bring").forEach((b) => {
+    b.onclick = async () => {
+      const model = b.getAttribute("data-model");
+      b.disabled = true; b.textContent = "Copying...";
+      try {
+        const r2 = await api("/api/nas/bring", "POST", { model });
+        toast(r2.detail);
+      } catch (e) { toast("Copy failed: " + e.message); }
+      pollDownload();
+      setTimeout(() => { loadNas(); }, 2000);
+    };
+  });
+};
+
+$("nas-path-save").onclick = async () => {
+  const path = $("nas-path-input").value.trim();
+  const r = await api("/api/nas/path", "POST", { path });
+  toast(r.detail);
+  loadNas();
+};
+
+loadCurated();
+
+// ---------- History & cost ----------
+let histWindow = "hour";
+
+const buildLine = (points, w, h, pad, vmin, vmax) => {
+  if (!points.length) return "";
+  const n = points.length;
+  const xspan = w - pad * 2, yspan = h - pad * 2;
+  const range = (vmax - vmin) || 1;
+  return points.map((v, i) => {
+    const x = pad + (n === 1 ? xspan / 2 : (i / (n - 1)) * xspan);
+    const y = pad + yspan - ((v - vmin) / range) * yspan;
+    return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+};
+
+const drawChart = (svgId, samples, headKey, workerKey, opts = {}) => {
+  const svg = $(svgId);
+  const W = 600, H = 140, P = 22;
+  const headVals = samples.map((s) => s[headKey]).filter((v) => v != null);
+  const workerVals = workerKey ? samples.map((s) => s[workerKey]).filter((v) => v != null) : [];
+  const all = headVals.concat(workerVals);
+  if (!all.length) { svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" class="axlabel">no data yet</text>`; return; }
+  let vmin = Math.min(...all), vmax = Math.max(...all);
+  if (opts.zeroBase) vmin = 0;
+  if (vmax === vmin) vmax = vmin + 1;
+  const pad = (vmax - vmin) * 0.1;
+  vmax += pad; if (!opts.zeroBase) vmin = Math.max(0, vmin - pad);
+
+  const scale = (s, key) => buildLine(s.map((x) => x[key]).filter((v) => v != null), W, H, P, vmin, vmax);
+  let svgParts = `<line class="ax" x1="${P}" y1="${H-P}" x2="${W-P}" y2="${H-P}"/>`;
+  svgParts += `<text class="axlabel" x="${P-4}" y="${P+4}" text-anchor="end">${Math.round(vmax)}</text>`;
+  svgParts += `<text class="axlabel" x="${P-4}" y="${H-P}" text-anchor="end">${Math.round(vmin)}</text>`;
+  if (workerKey) {
+    svgParts += `<path class="ln-worker" d="${scale(samples, workerKey)}"/>`;
+    svgParts += `<path class="ln-head" d="${scale(samples, headKey)}"/>`;
+  } else {
+    svgParts += `<path class="ln-single" d="${scale(samples, headKey)}"/>`;
+  }
+  svg.innerHTML = svgParts;
+};
+
+const loadCost = async () => {
+  const c = await api("/api/cost");
+  const card = (label, d) => `<div class="costcard"><div class="cc-label">${label}</div><div class="cc-val">$${d.cost_equiv.toFixed(2)}</div><div class="cc-sub">${fmtNum(d.tokens)} tokens</div></div>`;
+  $("cost-cards").innerHTML = card("Today", c.today) + card("This week", c.week) + card("All time", c.all)
+    + `<div class="costcard"><div class="cc-label">Rate</div><div class="cc-val" style="color:var(--muted)">$${c.rate_per_mtok}</div><div class="cc-sub">per 1M tokens</div></div>`;
+};
+
+const loadHistory = async () => {
+  const r = await api(`/api/history?window=${histWindow}`);
+  const s = r.samples;
+  drawChart("chart-tps", s, "tps", null, { zeroBase: true });
+  drawChart("chart-temp", s, "head_temp", "worker_temp");
+  drawChart("chart-power", s, "head_power", "worker_power", { zeroBase: true });
+  drawChart("chart-mem", s.map((x) => ({ ...x, head_gb: x.head_mem_used ? x.head_mem_used/1024 : null, worker_gb: x.worker_mem_used ? x.worker_mem_used/1024 : null })), "head_gb", "worker_gb", { zeroBase: true });
+};
+
+document.querySelectorAll(".hwin").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll(".hwin").forEach((x) => x.classList.toggle("active", x === b));
+    histWindow = b.getAttribute("data-win");
+    loadHistory();
+  };
+});
+
+loadCost(); loadHistory();
+setInterval(() => { loadCost(); loadHistory(); }, 15000);
+
+// ---------- vLLM version / image manager ----------
+const loadImageOverview = async () => {
+  let o;
+  try { o = await api("/api/image/overview"); } catch (e) { return; }
+  const cur = o.current || {};
+  $("img-current").innerHTML = `Running vLLM <b>${cur.vllm_version || "unknown"}</b> · image <b>${cur.image || "?"}</b>`;
+
+  // available newer NGC tags
+  const cands = (o.candidates || []).filter((c) => c.available);
+  const cdiv = $("img-candidates");
+  if (cands.length) {
+    cdiv.innerHTML = cands.map((c) => `
+      <div class="imgrow">
+        <div><div class="ir-tag ir-new">${c.tag}</div><div class="ir-meta">available on NGC, newer than current</div></div>
+        <div class="ir-act"><button class="img-update" data-tag="${c.tag}">Pull &amp; build</button></div>
+      </div>`).join("");
+  } else {
+    cdiv.innerHTML = '<p class="hint">No newer NGC tags detected right now. You are likely on the latest.</p>';
+  }
+  cdiv.querySelectorAll(".img-update").forEach((b) => {
+    b.onclick = async () => {
+      const tag = b.getAttribute("data-tag");
+      if (!confirm(`Pull and build ${tag}? This downloads ~19GB on each node and rebuilds the Ray layer. Your current image is kept for rollback.`)) return;
+      b.disabled = true;
+      toast((await api("/api/image/update", "POST", { tag })).detail);
+      pollImage();
+    };
+  });
+
+  // locally built images you can switch/rollback to
+  const locals = o.local_images || [];
+  const ldiv = $("img-locals");
+  if (locals.length) {
+    ldiv.innerHTML = `<p class="hint" style="margin-top:12px">Built images (switch or roll back):</p>` + locals.map((l) => `
+      <div class="imgrow">
+        <div><div class="ir-tag ir-have">gx10/vllm-ray:${l.tag}</div><div class="ir-meta">${l.size} · ${l.created}</div></div>
+        <div class="ir-act"><button class="img-switch" data-tag="${l.tag}">Use this</button></div>
+      </div>`).join("");
+    ldiv.querySelectorAll(".img-switch").forEach((b) => {
+      b.onclick = async () => {
+        const tag = b.getAttribute("data-tag");
+        if (!confirm(`Switch the cluster to gx10/vllm-ray:${tag}? The cluster will need a relaunch (Stop then Start).`)) return;
+        const r = await api("/api/image/switch", "POST", { tag });
+        toast(r.detail);
+      };
+    });
+  } else {
+    ldiv.innerHTML = "";
+  }
+};
+
+const pollImage = async () => {
+  let s;
+  try { s = await api("/api/image/status"); } catch (e) { return; }
+  const banner = $("img-banner");
+  const showing = s.active || s.status === "built" || s.status === "error";
+  banner.classList.toggle("hidden", !showing);
+  if (!showing) return;
+  $("img-status").textContent = s.error ? "error: " + s.error : s.status;
+  $("img-detail").textContent = s.detail || "";
+  const fill = $("img-fill");
+  fill.style.width = (s.percent || 0) + "%";
+  fill.className = "dl-fill" + (s.status === "error" ? " error" : "");
+  if (s.status === "built") { setTimeout(loadImageOverview, 1000); }
+};
+
+// image overview is heavy (NGC probes) - load it lazily when Manage opens
+let imageOverviewLoaded = false;
+const ensureImageOverview = () => {
+  if (imageOverviewLoaded) return;
+  imageOverviewLoaded = true;
+  loadImageOverview();
+};
+setInterval(pollImage, 2500);
+
+// ---------- engines: vLLM vs llama.cpp ----------
+const pollEngines = async () => {
+  let a;
+  try { a = await api("/api/engine/active"); } catch (e) { return; }
+  const vllmActive = a.engine === "vllm";
+  const llamaActive = a.engine === "llamacpp";
+  $("eng-vllm").classList.toggle("eng-active", vllmActive);
+  $("eng-llama").classList.toggle("eng-active", llamaActive);
+  const vs = $("eng-vllm-state"), ls = $("eng-llama-state");
+  vs.textContent = vllmActive ? `serving ${a.model}` : "idle";
+  vs.classList.toggle("live", vllmActive);
+  ls.textContent = llamaActive ? `serving ${a.model}` : "idle";
+  ls.classList.toggle("live", llamaActive);
+  // dynamic stop button reflects whatever is actually running
+  const stopBtn = $("engine-stop");
+  if (stopBtn) {
+    if (a.engine) {
+      stopBtn.classList.remove("hidden");
+      stopBtn.textContent = vllmActive ? "Stop vLLM" : "Stop llama.cpp";
+      stopBtn.setAttribute("data-engine", a.engine);
+    } else {
+      stopBtn.classList.add("hidden");
+    }
+  }
+};
+
+$("ll-load").onclick = async () => {
+  const repo = $("ll-repo").value.trim();
+  const gguf = $("ll-file").value.trim();
+  if (!repo || !gguf) { toast("Enter both a GGUF repo and file name."); return; }
+  if (!confirm(`Load ${gguf} on llama.cpp (single node)?\n\nThis downloads the GGUF if needed and serves it on port ${"8001"}. If vLLM is using the box, memory may be tight.`)) return;
+  $("ll-load").disabled = true;
+  const r = await api("/api/llama/start", "POST", { repo, gguf_file: gguf });
+  toast(r.detail);
+  $("ll-load").disabled = false;
+  pollEngines(); pollActivity();
+};
+
+$("engine-stop").onclick = async () => {
+  const engine = $("engine-stop").getAttribute("data-engine");
+  const label = engine === "vllm" ? "vLLM" : "llama.cpp";
+  if (!confirm(`Stop ${label}? This unloads the model it's serving.`)) return;
+  $("engine-stop").disabled = true;
+  try {
+    if (engine === "vllm") {
+      await api("/api/model/unload", "POST");
+    } else {
+      await api("/api/llama/stop", "POST");
+    }
+    toast(`Stopping ${label}...`);
+  } catch (e) {
+    toast("Stop failed: " + e.message);
+  }
+  $("engine-stop").disabled = false;
+  setTimeout(() => { pollEngines(); updateNowServing(); }, 1200);
+};
+
+pollEngines();
+setInterval(pollEngines, 5000);
+
+// ---------- engine logs (Serve tab) ----------
+let logEngine = "vllm";
+let logTimer = null;
+const fetchEngineLogs = async () => {
+  const view = $("engine-logview");
+  if (!view) return;
+  const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 60;
+  try {
+    const r = await api(`/api/logs?engine=${logEngine}`);
+    view.textContent = r.log || "(no output yet)";
+    if (atBottom) view.scrollTop = view.scrollHeight;
+  } catch (e) {
+    view.textContent = "Could not fetch logs.";
+  }
+};
+const startLogTimer = () => {
+  if (logTimer) clearInterval(logTimer);
+  if ($("log-follow") && $("log-follow").checked) {
+    logTimer = setInterval(fetchEngineLogs, 3000);
+  }
+};
+document.querySelectorAll(".logtab").forEach((t) => {
+  t.onclick = () => {
+    logEngine = t.getAttribute("data-log");
+    document.querySelectorAll(".logtab").forEach((x) => x.classList.toggle("active", x === t));
+    fetchEngineLogs();
+  };
+});
+if ($("log-follow")) {
+  $("log-follow").onchange = () => { startLogTimer(); if ($("log-follow").checked) fetchEngineLogs(); };
+}
+// load logs when the Serve tab is opened (lazy)
+let serveLogsStarted = false;
+const ensureEngineLogs = () => {
+  if (serveLogsStarted) return;
+  serveLogsStarted = true;
+  fetchEngineLogs();
+  startLogTimer();
+};
+
+// ---------- tabs ----------
+// Monitor shows two panes (telemetry + history); serve and manage are single.
+const TAB_PANES = {
+  monitor: ["pane-monitor", "pane-monitor-history"],
+  serve: ["pane-serve"],
+  manage: ["pane-manage"],
+};
+const allPanes = ["pane-monitor", "pane-monitor-history", "pane-serve", "pane-manage"];
+const switchTab = (name) => {
+  allPanes.forEach((p) => { const el = $(p); if (el) el.classList.remove("active"); });
+  (TAB_PANES[name] || []).forEach((p) => { const el = $(p); if (el) el.classList.add("active"); });
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.getAttribute("data-tab") === name));
+};
+document.querySelectorAll(".tab").forEach((t) => {
+  t.onclick = () => {
+    const name = t.getAttribute("data-tab");
+    switchTab(name);
+    if (name === "manage") ensureImageOverview();
+    if (name === "serve") ensureEngineLogs();
+  };
+});
+switchTab("monitor");
+
+// ---------- engine override toggle ----------
+let engineOverride = "auto";  // auto | vllm | llamacpp
+document.querySelectorAll(".et-opt").forEach((b) => {
+  b.onclick = () => {
+    engineOverride = b.getAttribute("data-engine");
+    document.querySelectorAll(".et-opt").forEach((x) => x.classList.toggle("active", x === b));
+    toast(engineOverride === "auto" ? "Engine: auto-pick by model format" : `Engine forced: ${engineOverride}`);
+  };
+});
+
+// ---------- now-serving status line (Monitor home) ----------
+const updateNowServing = async () => {
+  let a;
+  try { a = await api("/api/engine/active"); } catch (e) { return; }
+  const dot = $("ns-dot"), sum = $("ns-summary");
+  if (a.engine) {
+    dot.className = "ns-dot live";
+    const engLabel = a.engine === "llamacpp" ? "llama.cpp (single-node)" : "vLLM (cluster)";
+    sum.textContent = `Serving ${a.model} on ${engLabel}`;
+  } else {
+    dot.className = "ns-dot down";
+    sum.textContent = "Nothing serving. Load a model from the Serve tab.";
+  }
+};
+updateNowServing();
+setInterval(updateNowServing, 5000);
+
+const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
+
+// live metrics: compute tokens/sec from the delta in cumulative generated tokens
+let lastGen = null, lastGenTime = null;
+
+const fmtNum = (n) => {
+  if (n == null) return "--";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return Math.round(n).toString();
+};
+
+const setGauge = (fillId, pctId, value, isMem, total) => {
+  const fill = $(fillId), pct = $(pctId);
+  if (value == null) { fill.style.width = "0%"; pct.textContent = "--"; return; }
+  let widthPct, label;
+  if (isMem) {
+    widthPct = total ? Math.round((value / total) * 100) : 0;
+    label = `${(value / 1024).toFixed(0)}/${(total / 1024).toFixed(0)}G`;
+  } else {
+    widthPct = value;
+    label = value + "%";
+  }
+  fill.style.width = Math.min(widthPct, 100) + "%";
+  fill.className = "gfill" + (isMem ? " mem" : "") + (widthPct >= 92 ? " crit" : widthPct >= 80 ? " hot" : "");
+  pct.textContent = label;
+};
+
+const pollMetrics = async () => {
+  let m;
+  try { m = await api("/api/metrics"); } catch (e) { return; }
+  const s = m.serving || {};
+  // tokens/sec from cumulative counter delta
+  const now = Date.now();
+  if (s.gen_tokens_total != null && lastGen != null && lastGenTime != null) {
+    const dt = (now - lastGenTime) / 1000;
+    const dtok = s.gen_tokens_total - lastGen;
+    const tps = dt > 0 ? Math.max(0, dtok / dt) : 0;
+    $("m-tps").textContent = tps >= 1 ? tps.toFixed(1) : (dtok > 0 ? "<1" : "0");
+  }
+  if (s.gen_tokens_total != null) { lastGen = s.gen_tokens_total; lastGenTime = now; }
+  $("m-running").textContent = s.requests_running != null ? Math.round(s.requests_running) : "--";
+  $("m-waiting").textContent = s.requests_waiting != null ? Math.round(s.requests_waiting) : "--";
+  $("m-total").textContent = fmtNum(s.gen_tokens_total);
+
+  const h = m.nodes?.head || {}, w = m.nodes?.worker || {};
+  setGauge("ns-head-gpu", "ns-head-gpu-pct", h.gpu_util, false);
+  setGauge("ns-head-mem", "ns-head-mem-pct", h.mem_used, true, h.mem_total);
+  setGauge("ns-worker-gpu", "ns-worker-gpu-pct", w.gpu_util, false);
+  setGauge("ns-worker-mem", "ns-worker-mem-pct", w.mem_used, true, w.mem_total);
+  // extended readouts
+  const setNe = (id, v, suffix = "") => { const el = $(id); if (el) el.textContent = v != null ? v + suffix : "--"; };
+  setNe("ns-head-power", h.power); setNe("ns-head-temp", h.temp); setNe("ns-head-clk", h.clock_sm);
+  setNe("ns-worker-power", w.power); setNe("ns-worker-temp", w.temp); setNe("ns-worker-clk", w.clock_sm);
+};
+
+// ---------- job lifecycle banner (download -> load -> compile -> ready) ----------
+const ACTIVE_STATES = ["downloading", "loading", "loading weights", "compiling", "downloading weights", "copying"];
+const pollDownload = async () => {
+  let d;
+  try { d = await api("/api/download/status"); } catch (e) { return; }
+  const banner = $("dl-banner");
+  const isActive = d.active || ACTIVE_STATES.includes(d.status);
+  const isDone = d.status === "ready" || d.status === "error" || d.status === "downloaded";
+  const showing = isActive || isDone;
+  banner.classList.toggle("hidden", !showing);
+  banner.className = "dlbanner" + (showing ? "" : " hidden")
+    + (d.status === "ready" ? " state-ready" : "")
+    + (d.status === "error" ? " state-error" : "");
+  if (!showing) return;
+
+  $("dl-model").textContent = d.model || "";
+  $("dl-status").textContent = d.status;
+  $("dl-detail").textContent = d.error || d.detail || "";
+  $("dl-speed").textContent = d.speed || "";
+  // Cancel only makes sense while something is in progress
+  const cancelBtn = $("dl-cancel");
+  if (cancelBtn) cancelBtn.classList.toggle("hidden", !isActive);
+
+  const fill = $("dl-fill");
+  // downloading has a real percent; loading/compiling are indeterminate
+  if (d.status === "downloading" && d.percent != null) {
+    fill.className = "dl-fill";
+    fill.style.width = d.percent + "%";
+  } else if (d.status === "ready" || d.status === "downloaded") {
+    fill.className = "dl-fill";
+    fill.style.width = "100%";
+  } else if (d.status === "error") {
+    fill.className = "dl-fill";
+    fill.style.width = "100%";
+  } else {
+    // loading / compiling: animated indeterminate bar
+    fill.className = "dl-fill indet";
+  }
+
+  if (d.status === "ready") { setTimeout(() => { loadCurated(); pollStatus(); }, 600); }
+};
+
+$("dl-dismiss").onclick = async () => {
+  await api("/api/download/dismiss", "POST");
+  $("dl-banner").classList.add("hidden");
+};
+
+$("dl-cancel").onclick = async () => {
+  if (!confirm("Cancel this load? It stops the in-progress load/compile and returns the cluster to idle.")) return;
+  $("dl-cancel").disabled = true; $("dl-cancel").textContent = "Cancelling...";
+  try {
+    const r = await api("/api/model/cancel", "POST");
+    toast(r.detail);
+  } catch (e) {
+    toast("Cancel failed: " + e.message);
+  }
+  $("dl-cancel").disabled = false; $("dl-cancel").textContent = "Cancel";
+  setTimeout(() => { pollDownload(); updateNowServing(); pollEngines(); if (typeof loadLibrary === "function") loadLibrary(); }, 1200);
+};
+
+$("btn-unload").onclick = async () => {
+  $("btn-unload").disabled = true;
+  const r = await api("/api/model/unload", "POST");
+  toast(r.detail);
+  $("btn-unload").disabled = false;
+  pollStatus(); pollDownload();
+};
+
+tick(); pollStatus(); pollActivity(); pollMetrics(); pollDownload();
+setInterval(tick, 1000);
+setInterval(pollStatus, 4000);
+setInterval(pollActivity, 3000);
+setInterval(pollMetrics, 3000);
+setInterval(pollDownload, 2000);
+</script>
+</body>
+</html>
