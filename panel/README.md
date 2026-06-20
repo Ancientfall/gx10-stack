@@ -9,6 +9,7 @@ A small web control panel for the dual GB10 cluster. Runs on the head node (`mys
 - **Configuration checks**: link state and MTU, fabric reachability with jumbo-frame probe, netplan conflicts, worker SSH, Ray GPU registration, vLLM API.
 - **Optimize & fix** (idempotent): resolves the `40-cx7.yaml` netplan conflict, sets MTU 9000, disables IPv6 on the fabric, reloads sysctl tuning, drops page caches on both nodes, checks the Docker runtime.
 - **Serving config**: edit model, tensor parallel, GPU mem util, max length. Save writes to `cluster.env`; Reload swaps the model in the running cluster without a full restart.
+- **Playground**: a streaming, multi-turn chat against whatever engine is serving (vLLM or llama.cpp), with time-to-first-token and tok/s measured live in the browser off the token stream.
 - **Check RDMA**: confirms NCCL is using RDMA (NET/IB) and not falling back to TCP sockets.
 
 ## Install (on the head node)

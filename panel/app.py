@@ -2481,9 +2481,21 @@ def api_chat(payload: dict = Body(...)):
         return JSONResponse({"ok": False, "detail": "No model is serving. Load one first."},
                             status_code=409)
     messages = payload.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse({"ok": False, "detail": "No messages provided."}, status_code=400)
     max_tokens = max(1, min(8192, _as_int(payload.get("max_tokens"), 512)))
-    body = json.dumps({"model": model, "messages": messages,
-                       "max_tokens": max_tokens, "stream": True}).encode()
+    req_body = {"model": model, "messages": messages, "max_tokens": max_tokens,
+                "stream": True,
+                # ask the engine to emit a final usage chunk so the client can
+                # report exact completion tokens (and thus accurate tok/s).
+                "stream_options": {"include_usage": True}}
+    # optional sampling control; only forward when the client sets it.
+    if payload.get("temperature") is not None:
+        try:
+            req_body["temperature"] = max(0.0, min(2.0, float(payload["temperature"])))
+        except (TypeError, ValueError):
+            pass
+    body = json.dumps(req_body).encode()
 
     def gen():
         import urllib.request
