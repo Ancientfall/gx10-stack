@@ -360,6 +360,39 @@
   .pg-ctrl input { width: 78px; background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--text); font-family: var(--mono); font-size: 12px; padding: 6px 8px; }
   .pg-ctrl input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
   .pg-compose-side button { padding: 8px 20px; }
+
+  /* Telemetry: request latency */
+  .latgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .latcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 15px; }
+  .lat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .lat-name { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .lat-avg { font-family: var(--mono); font-size: 18px; color: var(--fabric); }
+  .lat-pcts { display: flex; gap: 12px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .lat-pcts b { color: var(--muted); font-weight: 600; }
+  .latextra { display: flex; flex-wrap: wrap; gap: 26px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 26px; }
+  .lx { display: flex; flex-direction: column; gap: 3px; }
+  .lx-k { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .lx-v { font-family: var(--mono); font-size: 14px; color: var(--text); }
+
+  /* Benchmark runner */
+  .benchpane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 26px; }
+  .bench-form { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-top: 12px; }
+  .bf-ctrl { display: flex; flex-direction: column; gap: 4px; }
+  .bf-ctrl label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .bf-ctrl input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--text); font-family: var(--mono); font-size: 12px; padding: 7px 9px; width: 110px; }
+  .bf-ctrl input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .bf-prompt { flex: 1; min-width: 200px; }
+  .bf-prompt input { width: 100%; font-family: var(--sans); }
+  .bench-status { margin-top: 14px; font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+  .bench-result { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-top: 12px; }
+  .br { background: #070b0f; border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
+  .br-v { font-family: var(--mono); font-size: 17px; color: var(--fabric); }
+  .br-k { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-top: 3px; }
+  .bench-hist { margin-top: 16px; overflow-x: auto; }
+  .bench-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; }
+  .bench-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
+  .bench-table td { padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--text); white-space: nowrap; }
+  .bench-table tr:last-child td { border-bottom: none; }
 </style>
 </head>
 <body>
@@ -448,6 +481,44 @@
         <div class="ne"><div class="ne-val" id="ns-worker-clk">--</div><div class="ne-lbl">SM MHz</div></div>
       </div>
     </div>
+  </div>
+
+  <h2 class="sec">Request latency</h2>
+  <div class="latgrid">
+    <div class="latcard">
+      <div class="lat-head"><span class="lat-name">First token</span><span class="lat-avg" id="lat-ttft-avg">--</span></div>
+      <div class="lat-pcts"><span>p50&nbsp;<b id="lat-ttft-p50">--</b></span><span>p95&nbsp;<b id="lat-ttft-p95">--</b></span><span>p99&nbsp;<b id="lat-ttft-p99">--</b></span></div>
+    </div>
+    <div class="latcard">
+      <div class="lat-head"><span class="lat-name">Per output token</span><span class="lat-avg" id="lat-itl-avg">--</span></div>
+      <div class="lat-pcts"><span>p50&nbsp;<b id="lat-itl-p50">--</b></span><span>p95&nbsp;<b id="lat-itl-p95">--</b></span><span>p99&nbsp;<b id="lat-itl-p99">--</b></span></div>
+    </div>
+    <div class="latcard">
+      <div class="lat-head"><span class="lat-name">End to end</span><span class="lat-avg" id="lat-e2e-avg">--</span></div>
+      <div class="lat-pcts"><span>p50&nbsp;<b id="lat-e2e-p50">--</b></span><span>p95&nbsp;<b id="lat-e2e-p95">--</b></span><span>p99&nbsp;<b id="lat-e2e-p99">--</b></span></div>
+    </div>
+    <div class="latcard">
+      <div class="lat-head"><span class="lat-name">Queue time</span><span class="lat-avg" id="lat-queue-avg">--</span></div>
+      <div class="lat-pcts"><span>p50&nbsp;<b id="lat-queue-p50">--</b></span><span>p95&nbsp;<b id="lat-queue-p95">--</b></span><span>p99&nbsp;<b id="lat-queue-p99">--</b></span></div>
+    </div>
+  </div>
+  <div class="latextra">
+    <div class="lx"><span class="lx-k">KV cache</span><span class="lx-v" id="lat-kv">--</span></div>
+    <div class="lx"><span class="lx-k">Successful reqs</span><span class="lx-v" id="lat-success">--</span></div>
+    <div class="lx"><span class="lx-k">Source</span><span class="lx-v" id="lat-engine">--</span></div>
+  </div>
+
+  <h2 class="sec">Benchmark</h2>
+  <div class="benchpane">
+    <p class="hint">Fire N concurrent streaming requests at the active model and measure aggregate throughput and time-to-first-token. Runs against whatever is serving right now.</p>
+    <div class="bench-form">
+      <div class="bf-ctrl"><label for="bench-conc">Concurrency</label><input id="bench-conc" type="number" min="1" max="64" value="4" /></div>
+      <div class="bf-ctrl"><label for="bench-maxtok">Max tokens</label><input id="bench-maxtok" type="number" min="1" max="2048" value="128" /></div>
+      <div class="bf-ctrl bf-prompt"><label for="bench-prompt">Prompt</label><input id="bench-prompt" type="text" value="Write a short paragraph about the future of computing." spellcheck="false" /></div>
+      <button class="primary" id="bench-run" aria-label="Run benchmark">Run</button>
+    </div>
+    <div class="bench-status hidden" id="bench-status"></div>
+    <div class="bench-hist" id="bench-hist"></div>
   </div>
 
   </div><!-- /pane-monitor telemetry part; history moves here via CSS order -->
@@ -1673,6 +1744,88 @@ const pollMetrics = async () => {
   setNe("ns-worker-power", w.power); setNe("ns-worker-temp", w.temp); setNe("ns-worker-clk", w.clock_sm);
 };
 
+// ---------- detailed request-latency telemetry ----------
+const fmtMs = (v) => (v == null ? "--" : (v >= 1000 ? (v / 1000).toFixed(2) + "s" : Math.round(v) + "ms"));
+const setLat = (key, blk) => {
+  blk = blk || {};
+  $(`lat-${key}-avg`).textContent = fmtMs(blk.avg_ms);
+  $(`lat-${key}-p50`).textContent = fmtMs(blk.p50_ms);
+  $(`lat-${key}-p95`).textContent = fmtMs(blk.p95_ms);
+  $(`lat-${key}-p99`).textContent = fmtMs(blk.p99_ms);
+};
+const pollTelemetry = async () => {
+  let t;
+  try { t = await api("/api/telemetry"); } catch (e) { return; }
+  const s = t.serving || {};
+  setLat("ttft", s.ttft); setLat("itl", s.itl); setLat("e2e", s.e2e); setLat("queue", s.queue);
+  $("lat-kv").textContent = s.kv_cache_pct != null ? s.kv_cache_pct + "%" : "--";
+  $("lat-success").textContent = s.requests_success_total != null ? fmtNum(s.requests_success_total) : "--";
+  const eng = t.engine === "llamacpp" ? "llama.cpp" : t.engine === "vllm" ? "vLLM" : "idle";
+  $("lat-engine").textContent = s.metrics_unavailable ? eng + " (no metrics)" : eng;
+};
+
+// ---------- benchmark runner ----------
+let benchTimer = null;
+const stopBenchPoll = () => { if (benchTimer) { clearInterval(benchTimer); benchTimer = null; } };
+const startBenchPoll = () => { if (!benchTimer) benchTimer = setInterval(pollBenchStatus, 1500); };
+const benchIdle = () => { $("bench-run").disabled = false; $("bench-run").textContent = "Run"; };
+const renderBenchResult = (r) => {
+  if (!r) return "";
+  return `<div class="bench-result">
+    <div class="br"><div class="br-v">${r.tps != null ? r.tps : "--"}</div><div class="br-k">tok/s aggregate</div></div>
+    <div class="br"><div class="br-v">${r.ttft_ms != null ? r.ttft_ms : "--"}</div><div class="br-k">avg TTFT ms</div></div>
+    <div class="br"><div class="br-v">${r.requests != null ? r.requests : "--"}</div><div class="br-k">requests</div></div>
+    <div class="br"><div class="br-v">${fmtNum(r.total_tokens)}</div><div class="br-k">tokens</div></div>
+    <div class="br"><div class="br-v">${r.duration_s != null ? r.duration_s + "s" : "--"}</div><div class="br-k">duration</div></div>
+  </div>`;
+};
+const pollBenchStatus = async () => {
+  let b;
+  try { b = await api("/api/benchmark/status"); } catch (e) { return; }
+  const el = $("bench-status");
+  if (b.status === "running" || b.status === "starting") {
+    el.classList.remove("hidden");
+    el.innerHTML = `<span class="spin"></span>${b.detail || "Running benchmark..."}`;
+  } else if (b.status === "done") {
+    el.classList.remove("hidden");
+    el.innerHTML = `<div>Done — ${b.detail || ""}</div>` + renderBenchResult(b.result);
+    stopBenchPoll(); benchIdle(); loadBenchHistory();
+  } else if (b.status === "error") {
+    el.classList.remove("hidden");
+    el.innerHTML = `<div style="color:var(--err)">${(b.error || "Benchmark failed.").replace(/</g, "&lt;")}</div>`;
+    stopBenchPoll(); benchIdle();
+  }
+};
+const loadBenchHistory = async () => {
+  let r;
+  try { r = await api("/api/benchmark/history"); } catch (e) { return; }
+  const rows = r.benchmarks || [];
+  if (!rows.length) { $("bench-hist").innerHTML = ""; return; }
+  const when = (ts) => new Date(ts * 1000).toLocaleString();
+  $("bench-hist").innerHTML = `<table class="bench-table">
+    <thead><tr><th>When</th><th>Model</th><th>Conc</th><th>tok/s</th><th>TTFT ms</th><th>Tokens</th><th>Dur s</th></tr></thead>
+    <tbody>${rows.map((b) => `<tr><td>${when(b.ts)}</td><td>${(b.model || "").replace(/</g, "&lt;")}</td><td>${b.concurrency}</td><td>${b.tps != null ? b.tps : "--"}</td><td>${b.ttft_ms != null ? b.ttft_ms : "--"}</td><td>${fmtNum(b.total_tokens)}</td><td>${b.duration_s != null ? b.duration_s : "--"}</td></tr>`).join("")}</tbody>
+  </table>`;
+};
+$("bench-run").onclick = async () => {
+  const concurrency = Math.max(1, Math.min(64, parseInt($("bench-conc").value, 10) || 4));
+  const max_tokens = Math.max(1, Math.min(2048, parseInt($("bench-maxtok").value, 10) || 128));
+  const prompt = $("bench-prompt").value.trim();
+  $("bench-run").disabled = true; $("bench-run").textContent = "Running...";
+  let r;
+  try { r = await api("/api/benchmark", "POST", { concurrency, max_tokens, prompt }); }
+  catch (e) { toast("Benchmark failed: " + e.message); benchIdle(); return; }
+  if (!r.ok) {
+    toast(r.detail);
+    if (r.detail && r.detail.includes("already running")) { startBenchPoll(); }
+    else { benchIdle(); }
+    return;
+  }
+  $("bench-status").classList.remove("hidden");
+  $("bench-status").innerHTML = `<span class="spin"></span>${r.detail}`;
+  startBenchPoll();
+};
+
 // ---------- job lifecycle banner (download -> load -> compile -> ready) ----------
 const ACTIVE_STATES = ["downloading", "loading", "loading weights", "compiling", "downloading weights", "copying"];
 const pollDownload = async () => {
@@ -1742,10 +1895,12 @@ $("btn-unload").onclick = async () => {
 };
 
 tick(); pollStatus(); pollActivity(); pollMetrics(); pollDownload();
+pollTelemetry(); loadBenchHistory(); pollBenchStatus();  // resume a running benchmark if one is in flight
 setInterval(tick, 1000);
 setInterval(pollStatus, 4000);
 setInterval(pollActivity, 3000);
 setInterval(pollMetrics, 3000);
+setInterval(pollTelemetry, 3000);
 setInterval(pollDownload, 2000);
 </script>
 </body>
