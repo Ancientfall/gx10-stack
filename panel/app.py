@@ -86,19 +86,36 @@ def read_env(path: Path) -> dict:
     return values
 
 
+_env_lock = threading.Lock()
+
+
 def write_env_value(path: Path, key: str, value: str) -> None:
-    """Update a single KEY="value" line in place, preserving the rest of the file."""
-    lines = path.read_text().splitlines() if path.exists() else []
-    pattern = re.compile(rf'^\s*{re.escape(key)}\s*=')
-    replaced = False
-    for i, line in enumerate(lines):
-        if pattern.match(line):
-            lines[i] = f'{key}="{value}"'
-            replaced = True
-            break
-    if not replaced:
-        lines.append(f'{key}="{value}"')
-    path.write_text("\n".join(lines) + "\n")
+    """Update a single KEY="value" line in place, preserving the rest of the file.
+    Serialized + atomic (temp file then os.replace) so concurrent writers from
+    different threads can't lose updates or leave a half-written file."""
+    with _env_lock:
+        lines = path.read_text().splitlines() if path.exists() else []
+        pattern = re.compile(rf'^\s*{re.escape(key)}\s*=')
+        replaced = False
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                lines[i] = f'{key}="{value}"'
+                replaced = True
+                break
+        if not replaced:
+            lines.append(f'{key}="{value}"')
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+
+
+def _as_int(value, default: int) -> int:
+    """Best-effort int coercion for request payloads; falls back to default on junk
+    so a bad 'ctx'/'max_tokens' can't 500 an endpoint."""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def cfg() -> dict:
@@ -282,10 +299,30 @@ _ttl_cache = {}
 _ttl_locks = {}
 _ttl_global = threading.Lock()
 
+# Empty-but-correctly-shaped values returned on a cold cache while another thread
+# is computing, so endpoints never emit a bare {} that the frontend would
+# dereference into errors (e.g. data.checks.forEach, data.nodes.head.gpu_util).
+_CACHE_SKELETONS = {
+    "status": {"overall": "idle", "running": False, "action": None, "checks": [],
+               "nodes": {"head": {}, "worker": {}}, "config": {}},
+    "metrics": {"serving": {}, "engine": None, "nodes": {"head": {}, "worker": {}}},
+    "telemetry": {"engine": None, "model": None, "serving": {}, "vllm": {}, "llamacpp": {}},
+    "library": {"models": [], "storage": {}},
+    "nas": [],
+    "engine_active": {"engine": None, "model": None, "port": None},
+    "image_overview": {"current": {}, "local_images": [], "current_ngc_tag": "", "candidates": []},
+}
+
+
+def _skeleton(key):
+    import copy
+    return copy.deepcopy(_CACHE_SKELETONS.get(key, {}))
+
 
 def cached(key: str, ttl: float, producer):
     """Return a cached value if fresh, else compute it. Non-blocking for readers:
-    if another thread is already computing, return the last known value (or {})."""
+    if another thread is already computing, return the last known value (or a
+    correctly-shaped empty skeleton, never a bare {})."""
     now = time.time()
     with _ttl_global:
         entry = _ttl_cache.get(key)
@@ -296,7 +333,7 @@ def cached(key: str, ttl: float, producer):
     if not lock.acquire(blocking=False):
         with _ttl_global:
             entry = _ttl_cache.get(key)
-        return entry[0] if entry else {}
+        return entry[0] if entry else _skeleton(key)
     try:
         value = producer()
         with _ttl_global:
@@ -619,7 +656,6 @@ def optimize() -> list:
         record("Netplan conflict", "ok", "No conflict.")
 
     # 2. MTU 9000 on the CX7 interface
-    _, mtu = _iface_speed_mtu(iface)[1], None
     _, mtu = _iface_speed_mtu(iface)
     if mtu != "9000":
         rc, _, err = _sudo(["ip", "link", "set", iface, "mtu", "9000"])
@@ -678,42 +714,48 @@ def rdma_check() -> dict:
 # Start / stop  (long running, run in a thread)
 # ------------------------------------------------------------
 def _run_launch(arg=None):
+    """Runs the launch script. The caller has already acquired _action_lock and set
+    _current_action; this worker releases the lock in its finally."""
     name = "stopping" if arg == "stop" else "starting"
-    with _action_lock:
-        _current_action["name"] = name
-        try:
-            if not LAUNCH_SCRIPT.exists():
-                log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
-                         f"Set GX10_KIT_DIR.")
-                return
-            cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
-            log_line(f"[{name}] {' '.join(cmd)}")
-            # Start the cluster idle: Ray + both nodes up, but no model auto-loaded.
-            # The user picks a model from the panel. (Stop is unaffected.)
-            env = dict(os.environ)
-            if arg != "stop":
-                env["NO_AUTOLOAD"] = "1"
-            proc = subprocess.Popen(cmd, cwd=str(KIT_DIR), text=True, env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            for line in proc.stdout:
-                if line.strip():
-                    log_line(line.rstrip())
-            proc.wait()
-            log_line(f"[{name}] finished (exit {proc.returncode}).")
-        finally:
-            _current_action["name"] = None
+    try:
+        if not LAUNCH_SCRIPT.exists():
+            log_line(f"[error] launch script not found at {LAUNCH_SCRIPT}. "
+                     f"Set GX10_KIT_DIR.")
+            return
+        cmd = ["bash", str(LAUNCH_SCRIPT)] + ([arg] if arg else [])
+        log_line(f"[{name}] {' '.join(cmd)}")
+        # Start the cluster idle: Ray + both nodes up, but no model auto-loaded.
+        # The user picks a model from the panel. (Stop is unaffected.)
+        env = dict(os.environ)
+        if arg != "stop":
+            env["NO_AUTOLOAD"] = "1"
+        proc = subprocess.Popen(cmd, cwd=str(KIT_DIR), text=True, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in proc.stdout:
+            if line.strip():
+                log_line(line.rstrip())
+        proc.wait()
+        log_line(f"[{name}] finished (exit {proc.returncode}).")
+    finally:
+        _current_action["name"] = None
+        _action_lock.release()
 
 
 def start_cluster():
-    if _current_action["name"]:
-        return {"ok": False, "detail": f"Busy: {_current_action['name']}"}
+    # Acquire the action lock in the request handler itself (non-blocking) so two
+    # near-simultaneous Start/Stop clicks cannot both pass the guard. The worker
+    # thread releases it when the launch finishes.
+    if not _action_lock.acquire(blocking=False):
+        return {"ok": False, "detail": f"Busy: {_current_action['name'] or 'a cluster action'}"}
+    _current_action["name"] = "starting"
     threading.Thread(target=_run_launch, daemon=True).start()
     return {"ok": True, "detail": "Start initiated. Watch the activity log."}
 
 
 def stop_cluster():
-    if _current_action["name"]:
-        return {"ok": False, "detail": f"Busy: {_current_action['name']}"}
+    if not _action_lock.acquire(blocking=False):
+        return {"ok": False, "detail": f"Busy: {_current_action['name'] or 'a cluster action'}"}
+    _current_action["name"] = "stopping"
     threading.Thread(target=_run_launch, args=("stop",), daemon=True).start()
     return {"ok": True, "detail": "Stop initiated."}
 
@@ -726,10 +768,50 @@ _download = {
     "detail": "", "speed": "", "started": None, "error": None,
 }
 _download_lock = threading.Lock()
+# Monotonic job id. Bumped on every successful claim and on every cancel, so a
+# worker thread that has been superseded or cancelled can detect it and stop
+# writing state. Workers carry the id they were started with.
+_job_id = 0
+# Handle to the active download subprocess (the `docker exec ... hf download`),
+# so cancel can terminate it directly instead of relying on pkill alone.
+_download_proc = None
 
 
-def _set_dl(**kw):
+def _claim_job(model=None, status="starting", detail="") -> tuple:
+    """Atomically claim the single job slot. Returns (job_id, None) on success or
+    (None, busy_detail) if a job is already active. Setting active=True happens in
+    the SAME critical section as the guard check, so two near-simultaneous requests
+    cannot both pass (closes the check-then-act race)."""
+    global _job_id
     with _download_lock:
+        if _download["active"]:
+            return None, f"Busy: {_download.get('model')} ({_download.get('status')})"
+        _job_id += 1
+        jid = _job_id
+        _download.update(active=True, model=model, status=status, percent=0,
+                         detail=detail or (f"Starting {model}..." if model else "Starting..."),
+                         speed="", error=None, started=time.time())
+    return jid, None
+
+
+def _job_is_current(jid) -> bool:
+    """True if this worker still owns the job slot (not cancelled/superseded)."""
+    return jid == _job_id
+
+
+def _release_job(jid) -> None:
+    """Clear active only if we still own the slot, so we never clobber a newer job."""
+    with _download_lock:
+        if jid == _job_id and _download["active"]:
+            _download["active"] = False
+
+
+def _set_dl(_jid=None, **kw):
+    """Update download state. If _jid is given and no longer the current job, the
+    write is dropped — a cancelled or superseded worker can't resurrect stale state."""
+    with _download_lock:
+        if _jid is not None and _jid != _job_id:
+            return
         _download.update(kw)
 
 
@@ -776,23 +858,23 @@ def _explain_error(log: str) -> str:
     return "Engine failed to start. See vLLM logs for details."
 
 
-def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -> bool:
+def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, jid=None) -> bool:
     """Poll until the model serves (return True) or fails (return False)."""
     c = cfg()
     port = c["API_PORT"]
     start = time.time()
     phase = "loading"
     while time.time() - start < timeout_s:
-        # user cancelled? stop watching immediately
-        if download_status().get("status") == "cancelled":
-            log_line(f"[model] watch for {model} stopped (cancelled)")
+        # cancelled or superseded by a newer job? stop watching immediately
+        if jid is not None and not _job_is_current(jid):
+            log_line(f"[model] watch for {model} stopped (cancelled/superseded)")
             return False
         rc, out, _ = run(["curl", "-s", "--max-time", "3", f"http://localhost:{port}/v1/models"], timeout=5)
         if rc == 0 and out:
             try:
                 served = json.loads(out)["data"][0]["id"]
                 if served == model:
-                    _set_dl(active=False, status="ready", percent=100,
+                    _set_dl(_jid=jid, active=False, status="ready", percent=100,
                             detail=f"{model} is live and serving.", error=None)
                     log_line(f"[model] {model} is ready and serving")
                     return True
@@ -806,16 +888,16 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -
             if mlen and not _retried:
                 real_max = int(mlen.group(1))
                 log_line(f"[model] {model} caps context at {real_max}; retrying")
-                _set_dl(active=True, status="loading",
+                _set_dl(_jid=jid, active=True, status="loading",
                         detail=f"{model} max context is {real_max}, retrying...")
                 _start_vllm(model, max_len_override=real_max)
                 _model_maxlen_cache[model] = real_max
-                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True)
+                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True, jid=jid)
             # fatal error?
             if ("engine core initialization failed" in low or "traceback (most recent call last)" in low
                     or "raise runtimeerror" in low):
                 reason = _explain_error(log)
-                _set_dl(active=False, status="error", error=reason, detail=reason)
+                _set_dl(_jid=jid, active=False, status="error", error=reason, detail=reason)
                 log_line(f"[model] load FAILED: {reason}")
                 return False
             if "capturing" in low or "graph" in low or "compile" in low:
@@ -823,9 +905,9 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -
             elif "loading safetensors" in low or "loading weights" in low:
                 phase = "loading weights"
         elapsed = int(time.time() - start)
-        _set_dl(active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
+        _set_dl(_jid=jid, active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
         time.sleep(5)
-    _set_dl(active=False, status="error", error="Timed out waiting for the model to load.",
+    _set_dl(_jid=jid, active=False, status="error", error="Timed out waiting for the model to load.",
             detail="Load timed out. Check the vLLM logs.")
     return False
 
@@ -834,11 +916,12 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False) -
 _model_maxlen_cache = {}
 
 
-def _download_worker(model: str, auto_load: bool):
+def _download_worker(model: str, auto_load: bool, jid=None):
     """Download weights into the cache with progress, then optionally load + watch."""
+    global _download_proc
     c = cfg()
     token = c.get("HF_TOKEN", "")
-    _set_dl(active=True, model=model, status="downloading", percent=0,
+    _set_dl(_jid=jid, active=True, model=model, status="downloading", percent=0,
             detail=f"Preparing to download {model}...", speed="", error=None, started=time.time())
     log_line(f"[download] starting {model}")
 
@@ -848,12 +931,16 @@ def _download_worker(model: str, auto_load: bool):
     proc = subprocess.Popen(
         ["docker", "exec", CONTAINER, "bash", "-lc", cmd],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    with _download_lock:
+        _download_proc = proc
 
     last_pct = 0
     pat_pct = re.compile(r'(\d+)%')
     pat_speed = re.compile(r'([\d.]+[KMG]B/s)')
     saw_error = None
     for line in proc.stdout:
+        if jid is not None and not _job_is_current(jid):
+            break  # cancelled/superseded: stop reading; cancel_load kills the proc
         line = line.strip()
         if not line:
             continue
@@ -870,30 +957,38 @@ def _download_worker(model: str, auto_load: bool):
             if pct >= last_pct:
                 last_pct = pct
                 sp = pat_speed.search(line)
-                _set_dl(percent=pct, status="downloading",
+                _set_dl(_jid=jid, percent=pct, status="downloading",
                         detail=f"Downloading {model}", speed=sp.group(1) if sp else "")
     proc.wait()
+    with _download_lock:
+        if _download_proc is proc:
+            _download_proc = None
+
+    # cancelled/superseded while downloading: leave the final state to the canceller
+    if jid is not None and not _job_is_current(jid):
+        log_line(f"[download] {model} stopped (cancelled/superseded)")
+        return
 
     if saw_error or proc.returncode != 0:
         msg = saw_error or f"Download failed (exit {proc.returncode}). See activity log."
-        _set_dl(active=False, status="error", error=msg, detail=msg)
+        _set_dl(_jid=jid, active=False, status="error", error=msg, detail=msg)
         log_line(f"[download] FAILED {model}: {msg}")
         return
 
-    _set_dl(percent=100, status="downloaded", detail=f"{model} downloaded.")
+    _set_dl(_jid=jid, percent=100, status="downloaded", detail=f"{model} downloaded.")
     log_line(f"[download] complete {model}")
 
     if auto_load:
         write_env_value(CLUSTER_ENV, "MODEL", model)
-        _set_dl(active=True, status="loading", detail=f"Starting {model} on the cluster...")
+        _set_dl(_jid=jid, active=True, status="loading", detail=f"Starting {model} on the cluster...")
         log_line(f"[model] auto-loading {model}")
         rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
         if rc != 0:
-            _set_dl(active=False, status="error", error=f"Load failed: {err}")
+            _set_dl(_jid=jid, active=False, status="error", error=f"Load failed: {err}")
             return
-        _watch_vllm_until_ready(model)
+        _watch_vllm_until_ready(model, jid=jid)
     else:
-        _set_dl(active=False, status="downloaded")
+        _set_dl(_jid=jid, active=False, status="downloaded")
 
 
 def currently_serving() -> str:
@@ -908,54 +1003,71 @@ def currently_serving() -> str:
     return ""
 
 
-def _load_worker(model: str):
+def _load_worker(model: str, jid=None):
     """Load a cached model with rollback: if it fails, restore the previous one."""
     previous = currently_serving()
     write_env_value(CLUSTER_ENV, "MODEL", model)
-    _set_dl(active=True, model=model, status="loading", percent=0,
+    _set_dl(_jid=jid, active=True, model=model, status="loading", percent=0,
             detail=f"Starting {model}...", speed="", error=None, started=time.time())
     log_line(f"[model] loading {model}" + (f" (was {previous})" if previous else ""))
     rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
     if rc != 0:
-        _set_dl(active=False, status="error", error=f"Could not start: {err}")
+        if not previous:
+            write_env_value(CLUSTER_ENV, "MODEL", "")
+        _set_dl(_jid=jid, active=False, status="error", error=f"Could not start: {err}")
         return
-    ok = _watch_vllm_until_ready(model)
+    ok = _watch_vllm_until_ready(model, jid=jid)
     if ok:
+        return
+    # cancelled/superseded: the canceller owns the final state; don't roll back
+    if jid is not None and not _job_is_current(jid):
         return
     # failed: roll back to the previous working model if there was one
     if previous and previous != model:
         log_line(f"[model] rolling back to {previous}")
         cur = download_status()
-        _set_dl(active=True, model=previous, status="loading",
+        _set_dl(_jid=jid, active=True, model=previous, status="loading",
                 detail=f"Load failed. Rolling back to {previous}...",
                 error=cur.get("error"))
         write_env_value(CLUSTER_ENV, "MODEL", previous)
         rc2, _, _ = _start_vllm(previous, _model_maxlen_cache.get(previous))
-        if rc2 == 0 and _watch_vllm_until_ready(previous):
-            _set_dl(active=False, status="error",
+        if rc2 == 0 and _watch_vllm_until_ready(previous, jid=jid):
+            _set_dl(_jid=jid, active=False, status="error",
                     error=f"{model} failed to load. Rolled back to {previous}.",
                     detail=f"{model} failed. {previous} restored and serving.")
             log_line(f"[model] rolled back to {previous} after {model} failed")
+        else:
+            _set_dl(_jid=jid, active=False, status="error",
+                    error=f"{model} failed to load, and rolling back to {previous} also failed.",
+                    detail="Both the new model and the rollback failed. Check the vLLM logs.")
+            log_line(f"[model] rollback to {previous} FAILED after {model} failed")
+    else:
+        # nothing was serving before: clear the failed model from config so the next
+        # cluster start doesn't auto-load a model we already know is broken
+        write_env_value(CLUSTER_ENV, "MODEL", "")
+        _set_dl(_jid=jid, active=False, status="error",
+                error=f"{model} failed to load.",
+                detail=f"{model} failed to load. Cluster is idle. See the vLLM logs.")
 
 
 def start_download(model: str, auto_load: bool = True):
-    with _download_lock:
-        if _download["active"]:
-            return {"ok": False, "detail": f"A job is already running: {_download['model']}"}
-    threading.Thread(target=_download_worker, args=(model, auto_load), daemon=True).start()
+    jid, busy = _claim_job(model, status="downloading", detail=f"Preparing to download {model}...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
+    threading.Thread(target=_download_worker, args=(model, auto_load, jid), daemon=True).start()
     return {"ok": True, "detail": f"Download started for {model}."}
 
 
 def swap_model(model: str):
     """Cached -> load + watch (with rollback). Not cached -> download + auto-load."""
-    with _download_lock:
-        if _download["active"]:
-            return {"ok": False, "detail": f"Busy: {_download['model']} ({_download['status']})"}
+    jid, busy = _claim_job(model, status="loading", detail=f"Loading {model}...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
     cached = {m["id"] for m in hf_cache_models()}
     if model in cached:
-        threading.Thread(target=_load_worker, args=(model,), daemon=True).start()
+        threading.Thread(target=_load_worker, args=(model, jid), daemon=True).start()
         return {"ok": True, "detail": f"Loading cached {model}..."}
-    threading.Thread(target=_download_worker, args=(model, True), daemon=True).start()
+    threading.Thread(target=_download_worker, args=(model, True, jid), daemon=True).start()
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
 
 
@@ -1021,17 +1133,29 @@ def cancel_load():
     """Force-stop any in-progress load/compile/download and return to idle.
     Works even when a job is active (unlike unload), so a stuck or failing
     load can always be aborted."""
-    # signal any watch loop to give up
-    _set_dl(active=False, status="cancelled", detail="Cancelling...", error=None)
+    global _job_id, _download_proc
+    # bump the epoch so any in-flight worker stops writing state, and grab the proc
+    with _download_lock:
+        _job_id += 1
+        proc = _download_proc
+        _download_proc = None
+        _download.update(active=False, status="cancelled", detail="Cancelling...", error=None)
+    # terminate the tracked download subprocess (the docker-exec wrapper) directly
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     # kill vLLM serve (stops a compiling/initializing load)
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
-    # kill any in-flight hf download
-    run(["pkill", "-f", "huggingface-cli download"], timeout=8)
-    run(["pkill", "-f", "hf download"], timeout=8)
+    # kill any in-flight hf download — it runs INSIDE the container, not on the host,
+    # so the pkill must run via docker exec (the old host-side pkill matched nothing)
+    run(["docker", "exec", CONTAINER, "pkill", "-f", "hf download"], timeout=8)
+    run(["docker", "exec", CONTAINER, "pkill", "-f", "huggingface-cli download"], timeout=8)
     time.sleep(1)
-    _set_dl(active=False, status="idle", model=None, percent=0, detail="", error=None)
+    with _download_lock:
+        _download.update(active=False, status="idle", model=None, percent=0, detail="", error=None)
     invalidate_cache("library", "engine_active", "status", "metrics")
-    # clear any stale cached "currently serving" so the UI shows idle
     log_line("[model] load cancelled by user; cluster idle")
     return {"ok": True, "detail": "Load cancelled. Cluster is idle. Pick a model when ready."}
 
@@ -1209,8 +1333,10 @@ def nas_models() -> list:
     return out
 
 
-def _nas_copy_worker(model_id: str, src_path: str, kind: str):
-    """Copy a model from the NAS to the local HF cache, with progress."""
+def _nas_copy_worker(model_id: str, src_path: str, kind: str, jid=None):
+    """Copy a model from the NAS to the local HF cache, with progress.
+    Copies to a temp path and renames on success, so a cancelled or failed copy
+    never leaves a partial model in the cache that hf_cache_models() would list."""
     import shutil as _sh
     c = cfg()
     cache = Path(c.get("HF_CACHE_DIR", ""))
@@ -1219,53 +1345,78 @@ def _nas_copy_worker(model_id: str, src_path: str, kind: str):
             if Path(src_path).is_dir() else Path(src_path).stat().st_size
     except Exception:
         total = 0
-    _set_dl(active=True, model=model_id, status="copying", percent=0,
+    _set_dl(_jid=jid, active=True, model=model_id, status="copying", percent=0,
             detail=f"Copying {model_id} from NAS to local...", started=time.time(), error=None)
+    tmp = None
     try:
         if kind == "gguf":
             dest_dir = cache / "gguf"
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / Path(src_path).name
-            _copy_with_progress(Path(src_path), dest, total, model_id)
+            tmp = dest.with_name(dest.name + ".partial")
+            if tmp.exists():
+                tmp.unlink()
+            _copy_with_progress(Path(src_path), tmp, total, model_id, jid)
+            if jid is not None and not _job_is_current(jid):
+                tmp.unlink(missing_ok=True)
+                return
+            os.replace(tmp, dest)
         else:
             dirname = "models--" + model_id.replace("/", "--")
             dest = cache / "hub" / dirname
-            dest.mkdir(parents=True, exist_ok=True)
+            tmp = cache / "hub" / (dirname + ".partial")
+            _sh.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True, exist_ok=True)
             # copy tree file by file for progress
             copied = 0
             for f in Path(src_path).rglob("*"):
+                if jid is not None and not _job_is_current(jid):
+                    _sh.rmtree(tmp, ignore_errors=True)
+                    return
                 if f.is_file():
                     rel = f.relative_to(src_path)
-                    target = dest / rel
+                    target = tmp / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
                     _sh.copy2(f, target)
                     copied += f.stat().st_size
                     if total:
                         pct = int(copied / total * 100)
-                        _set_dl(active=True, model=model_id, status="copying", percent=pct,
+                        _set_dl(_jid=jid, active=True, model=model_id, status="copying", percent=pct,
                                 detail=f"Copying from NAS... {pct}%")
-        _set_dl(active=False, status="ready", percent=100,
+            _sh.rmtree(dest, ignore_errors=True)
+            os.replace(tmp, dest)
+        _set_dl(_jid=jid, active=False, status="ready", percent=100,
                 detail=f"{model_id} copied to local. Ready to load.", error=None)
         invalidate_cache("library", "nas")
         log_line(f"[nas] copied {model_id} from NAS to local cache")
     except Exception as e:
-        _set_dl(active=False, status="error", error=f"NAS copy failed: {e}")
+        if tmp is not None:
+            try:
+                if tmp.is_dir():
+                    _sh.rmtree(tmp, ignore_errors=True)
+                elif tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+        _set_dl(_jid=jid, active=False, status="error", error=f"NAS copy failed: {e}")
         log_line(f"[nas] copy failed for {model_id}: {e}")
 
 
-def _copy_with_progress(src: Path, dest: Path, total: int, model_id: str):
+def _copy_with_progress(src: Path, dest: Path, total: int, model_id: str, jid=None):
     import shutil as _sh
     if total > 5e9:  # large single file: chunked copy with progress
         copied = 0
         with open(src, "rb") as fi, open(dest, "wb") as fo:
             while True:
+                if jid is not None and not _job_is_current(jid):
+                    return
                 chunk = fi.read(16 * 1024 * 1024)
                 if not chunk:
                     break
                 fo.write(chunk)
                 copied += len(chunk)
                 pct = int(copied / total * 100) if total else 0
-                _set_dl(active=True, model=model_id, status="copying", percent=pct,
+                _set_dl(_jid=jid, active=True, model=model_id, status="copying", percent=pct,
                         detail=f"Copying from NAS... {pct}%")
     else:
         _sh.copy2(src, dest)
@@ -1273,15 +1424,16 @@ def _copy_with_progress(src: Path, dest: Path, total: int, model_id: str):
 
 def bring_from_nas(model_id: str) -> dict:
     """Stage a NAS-archived model onto local NVMe (background copy)."""
-    with _download_lock:
-        if _download["active"]:
-            return {"ok": False, "detail": f"Busy: {_download['model']} ({_download['status']})"}
     archived = {m["id"]: m for m in nas_models()}
     if model_id not in archived:
         return {"ok": False, "detail": "That model isn't in the NAS archive."}
     m = archived[model_id]
+    jid, busy = _claim_job(model_id, status="copying",
+                           detail=f"Copying {model_id} from NAS to local...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
     threading.Thread(target=_nas_copy_worker,
-                     args=(model_id, m["path"], m["kind"]), daemon=True).start()
+                     args=(model_id, m["path"], m["kind"], jid), daemon=True).start()
     return {"ok": True, "detail": f"Copying {model_id} from NAS to local. Watch progress in the banner."}
 
 
@@ -1511,34 +1663,36 @@ def active_engine() -> dict:
     return {"engine": None, "model": None, "port": None}
 
 
-def _llama_start_worker(repo: str, gguf_file: str, ctx: int):
+def _llama_start_worker(repo: str, gguf_file: str, ctx: int, jid=None):
     """Download (if needed) + start llama.cpp in the background, reporting progress."""
     script = str(KIT_DIR / "llama-serve.sh")
-    _set_dl(active=True, model=gguf_file, status="loading", percent=0,
+    _set_dl(_jid=jid, active=True, model=gguf_file, status="loading", percent=0,
             detail=f"Starting llama.cpp with {gguf_file} (downloads first if needed)...",
             started=time.time(), error=None)
     log_line(f"[llama] starting {repo} / {gguf_file}")
     # no short timeout: a GGUF download can take a long time
     rc, out, err = run(["bash", script, repo, gguf_file, str(ctx)], timeout=3600)
+    if jid is not None and not _job_is_current(jid):
+        return
     if rc != 0:
         msg = (err or out or "unknown error")[:240]
-        _set_dl(active=False, status="error", error=f"llama.cpp failed: {msg}")
+        _set_dl(_jid=jid, active=False, status="error", error=f"llama.cpp failed: {msg}")
         log_line(f"[llama] start failed: {msg}")
         invalidate_cache("engine_active", "library")
         return
     # wait for the server to actually answer before calling it ready
     for _ in range(60):
+        if jid is not None and not _job_is_current(jid):
+            return
         if llama_serving():
-            _set_dl(active=False, status="ready", percent=100,
+            _set_dl(_jid=jid, active=False, status="ready", percent=100,
                     detail=f"llama.cpp serving {gguf_file} on :{LLAMA_PORT}.", error=None)
             log_line(f"[llama] {gguf_file} is serving")
             invalidate_cache("engine_active", "library")
             return
-        if download_status().get("status") == "cancelled":
-            return
         time.sleep(2)
     # started but not answering yet; leave a soft note
-    _set_dl(active=False, status="ready", detail=f"llama.cpp started {gguf_file}; warming up.")
+    _set_dl(_jid=jid, active=False, status="ready", detail=f"llama.cpp started {gguf_file}; warming up.")
     invalidate_cache("engine_active", "library")
 
 
@@ -1547,10 +1701,11 @@ def start_llama(repo: str, gguf_file: str, ctx: int = 32768):
     script = str(KIT_DIR / "llama-serve.sh")
     if not Path(script).exists():
         return {"ok": False, "detail": "llama-serve.sh not found in cluster kit."}
-    with _download_lock:
-        if _download["active"]:
-            return {"ok": False, "detail": f"Busy: {_download['model']} ({_download['status']})"}
-    threading.Thread(target=_llama_start_worker, args=(repo, gguf_file, ctx), daemon=True).start()
+    jid, busy = _claim_job(gguf_file, status="loading",
+                           detail=f"Starting llama.cpp with {gguf_file}...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
+    threading.Thread(target=_llama_start_worker, args=(repo, gguf_file, ctx, jid), daemon=True).start()
     return {"ok": True, "detail": f"Starting llama.cpp with {gguf_file}. Watch progress in the banner."}
 
 
@@ -1822,6 +1977,10 @@ def pick_gguf_file(files: list, prefer: str = None) -> str:
 def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
     """Engine-agnostic load: detect format, route to vLLM or llama.cpp.
     Runs the actual work in a background thread so the request returns immediately."""
+    jid, busy = _claim_job(model, status="loading", detail=f"Loading {model}...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
+
     def _route_worker():
         # Case 1: model is already a local GGUF file (from the Library).
         # Serve it directly on llama.cpp; do not treat the filename as a repo.
@@ -1830,10 +1989,10 @@ def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
             chosen_file = model if model.lower().endswith(".gguf") else local_gguf[model]["id"]
             if currently_serving():
                 log_line("[engine] stopping vLLM to free the box for llama.cpp")
-                _set_dl(active=True, model=model, status="loading", detail="Stopping vLLM...")
+                _set_dl(_jid=jid, active=True, model=model, status="loading", detail="Stopping vLLM...")
                 run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
             # repo arg is empty: the file is already local, llama-serve.sh serves it directly
-            _llama_start_worker("", chosen_file, ctx)
+            _llama_start_worker("", chosen_file, ctx, jid)
             return
 
         files = hf_repo_files(model)
@@ -1841,27 +2000,27 @@ def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
         if decision["engine"] == "llamacpp":
             chosen = gguf_file or pick_gguf_file(files)
             if not chosen:
-                _set_dl(active=False, status="error",
+                _set_dl(_jid=jid, active=False, status="error",
                         error=f"No GGUF file found in {model}. Pick a GGUF repo or specify a file.")
                 return
             if currently_serving():
                 log_line("[engine] stopping vLLM to free the box for llama.cpp")
-                _set_dl(active=True, model=model, status="loading", detail="Stopping vLLM...")
+                _set_dl(_jid=jid, active=True, model=model, status="loading", detail="Stopping vLLM...")
                 run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
             # run the llama start+download inline (we're already in a worker thread)
-            _llama_start_worker(model, chosen, ctx)
+            _llama_start_worker(model, chosen, ctx, jid)
             return
         # vLLM path
         if llama_serving():
             log_line("[engine] stopping llama.cpp to free the box for vLLM")
-            _set_dl(active=True, model=model, status="loading", detail="Stopping llama.cpp...")
+            _set_dl(_jid=jid, active=True, model=model, status="loading", detail="Stopping llama.cpp...")
             stop_llama()
         # we're already in a worker thread; run the load/download logic inline
         cached = {m["id"] for m in hf_cache_models()}
         if model in cached:
-            _load_worker(model)
+            _load_worker(model, jid)
         else:
-            _download_worker(model, True)
+            _download_worker(model, True, jid)
 
     threading.Thread(target=_route_worker, daemon=True).start()
     return {"ok": True, "detail": f"Loading {model}. Watch progress in the activity log.", "async": True}
@@ -1881,11 +2040,13 @@ def api_model(payload: dict = Body(...)):
         chosen = payload.get("gguf_file") or pick_gguf_file(files)
         if not chosen:
             return JSONResponse({"ok": False, "detail": f"No GGUF file in {model}."}, status_code=400)
-        if currently_serving():
+        res = start_llama(model, chosen, _as_int(payload.get("ctx"), 32768))
+        # only stop vLLM once the llama job is actually claimed, so a "busy" rejection
+        # can't leave the box with vLLM killed and nothing started
+        if res.get("ok") and currently_serving():
             run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
-        return JSONResponse({**start_llama(model, chosen, int(payload.get("ctx", 32768))),
-                             "engine": "llamacpp", "gguf_file": chosen})
-    return JSONResponse(route_model(model, payload.get("gguf_file"), int(payload.get("ctx", 32768))))
+        return JSONResponse({**res, "engine": "llamacpp", "gguf_file": chosen})
+    return JSONResponse(route_model(model, payload.get("gguf_file"), _as_int(payload.get("ctx"), 32768)))
 
 
 @app.get("/api/models/curated")
@@ -1972,7 +2133,7 @@ def api_models_test(payload: dict = Body(...)):
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return JSONResponse({"ok": False, "detail": "No prompt provided"}, status_code=400)
-    return JSONResponse(test_prompt(prompt, int(payload.get("max_tokens", 128))))
+    return JSONResponse(test_prompt(prompt, _as_int(payload.get("max_tokens"), 128)))
 
 
 @app.get("/api/download/status")
@@ -2040,7 +2201,7 @@ def api_engine_detect(payload: dict = Body(...)):
 def api_llama_start(payload: dict = Body(...)):
     repo = (payload.get("repo") or "").strip()
     gguf = (payload.get("gguf_file") or "").strip()
-    ctx = int(payload.get("ctx", 32768))
+    ctx = _as_int(payload.get("ctx"), 32768)
     if not repo or not gguf:
         return JSONResponse({"ok": False, "detail": "Need repo and gguf_file"}, status_code=400)
     return JSONResponse(start_llama(repo, gguf, ctx))
