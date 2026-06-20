@@ -7,6 +7,7 @@ A small web control panel for the dual GB10 cluster. Runs on the head node (`mys
 - **Live fabric view**: the two nodes and the ConnectX-7 link, lit green at 200G when healthy, amber when degraded, red when down.
 - **Request latency telemetry**: live TTFT, per-output-token, end-to-end, and queue-time latency (avg + p50/p95/p99) plus KV-cache use and successful-request count, parsed from the serving engine's Prometheus metrics (vLLM full histograms; llama.cpp averages).
 - **Benchmark**: fire N concurrent streaming requests at the active model and read back aggregate tok/s and average TTFT, with a history of past runs.
+- **History trends**: hour/day/week charts for throughput, temperature, power, memory, and serving quality (TTFT, inter-token and end-to-end latency, KV-cache use), plus a token-cost summary.
 - **Start / Stop**: runs your `02-launch-cluster.sh` and streams output into the activity log.
 - **Configuration checks**: link state and MTU, fabric reachability with jumbo-frame probe, netplan conflicts, worker SSH, Ray GPU registration, vLLM API.
 - **Optimize & fix** (idempotent): resolves the `40-cx7.yaml` netplan conflict, sets MTU 9000, disables IPv6 on the fabric, reloads sysctl tuning, drops page caches on both nodes, checks the Docker runtime.

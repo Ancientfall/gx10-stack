@@ -599,6 +599,10 @@
     <div class="chart"><div class="chart-title">Temperature (&deg;C)</div><svg id="chart-temp" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
     <div class="chart"><div class="chart-title">Power draw (W)</div><svg id="chart-power" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
     <div class="chart"><div class="chart-title">Memory used (GB)</div><svg id="chart-mem" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Time to first token (ms)</div><svg id="chart-ttft" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">Inter-token latency (ms)</div><svg id="chart-itl" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">End-to-end latency (ms)</div><svg id="chart-e2e" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart"><div class="chart-title">KV cache use (%)</div><svg id="chart-kv" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div>
   </div>
   </div><!-- /pane-monitor-history -->
 
@@ -1450,6 +1454,11 @@ const loadHistory = async () => {
   drawChart("chart-temp", s, "head_temp", "worker_temp");
   drawChart("chart-power", s, "head_power", "worker_power", { zeroBase: true });
   drawChart("chart-mem", s.map((x) => ({ ...x, head_gb: x.head_mem_used ? x.head_mem_used/1024 : null, worker_gb: x.worker_mem_used ? x.worker_mem_used/1024 : null })), "head_gb", "worker_gb", { zeroBase: true });
+  // serving-quality trends (collected into samples but cluster-wide, so single-series)
+  drawChart("chart-ttft", s, "ttft_ms", null, { zeroBase: true });
+  drawChart("chart-itl", s, "itl_ms", null, { zeroBase: true });
+  drawChart("chart-e2e", s, "e2e_ms", null, { zeroBase: true });
+  drawChart("chart-kv", s, "kv_cache", null, { zeroBase: true });
 };
 
 document.querySelectorAll(".hwin").forEach((b) => {
