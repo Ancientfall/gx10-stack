@@ -56,12 +56,23 @@ SPEC_CONFIG=$(printf '{"method":"dflash","model":"%s","num_speculative_tokens":%
 EXTRA=()
 [[ "${TRUST_REMOTE}" == "1" ]] && EXTRA+=( --trust-remote-code )
 
+# Persist the vLLM torch.compile / CUDA-graph cache on the host so reloads skip the
+# ~70s recompile, and keep server logs on the host so a crashed container is debuggable.
+VLLM_CACHE_DIR="${VLLM_CACHE_DIR:-${HF_CACHE_DIR%/}/../vllm-cache}"
+LOG_DIR="${DFLASH_LOG_DIR:-${HF_CACHE_DIR%/}/../vllm-logs}"
+mkdir -p "${VLLM_CACHE_DIR}" "${LOG_DIR}"
+# unless-stopped: survives reboot/crash, but an explicit panel/script stop (docker rm)
+# keeps it down. Set DFLASH_RESTART=no to disable.
+RESTART="${DFLASH_RESTART:-unless-stopped}"
+
 docker rm -f "${CONTAINER}" 2>/dev/null || true
 log "Starting vLLM+DFlash: ${MODEL} (draft ${DRAFT}, num_spec=${NUM_SPEC}, gpu_util=${GPU_UTIL}) on :${PORT}"
 docker run -d --name "${CONTAINER}" --gpus all \
+    --restart "${RESTART}" \
     --ipc host \
     --ulimit memlock=-1 \
     -v "${HF_CACHE_DIR}:/root/.cache/huggingface" \
+    -v "${VLLM_CACHE_DIR}:/root/.cache/vllm" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -p "${PORT}:${PORT}" \
     --entrypoint vllm \

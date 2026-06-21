@@ -1,5 +1,7 @@
 # Secrets and local config (never commit your HF token)
 cluster.env
+cluster.env.bak*
+*.bak-*
 *.env.local
 
 # Python

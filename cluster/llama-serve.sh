@@ -108,8 +108,12 @@ fi
 DOCKER_ENV=()
 [[ "${UNIFIED_MEM}" == "1" ]] && DOCKER_ENV+=( -e GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 )
 
+# unless-stopped: auto-recover on reboot/crash; an explicit stop (docker rm) keeps it down.
+RESTART="${LLAMA_RESTART:-unless-stopped}"
+
 # The ardge-labs image IS the server; pass model + args directly (no --server flag).
 docker run -d --name "${LLAMA_CONTAINER}" --gpus all \
+    --restart "${RESTART}" \
     "${DOCKER_ENV[@]}" \
     -v "${GGUF_DIR}:/models" \
     -p "${LLAMA_PORT}:${LLAMA_PORT}" \

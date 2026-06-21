@@ -52,6 +52,10 @@ ${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/sysctl *
 ${PANEL_USER} ALL=(root) NOPASSWD: /usr/sbin/ip link set * mtu *
 ${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/mv /etc/netplan/40-cx7.yaml /etc/netplan/40-cx7.yaml.disabled
 ${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
+# manage own service without a password (unattended deploy / self-update / restart)
+${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart gx10-panel.service
+${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start gx10-panel.service
+${PANEL_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop gx10-panel.service
 EOF
 if visudo -cf "${SUDO_FILE}" >/dev/null 2>&1; then
     sudo cp "${SUDO_FILE}" /etc/sudoers.d/gx10-panel
