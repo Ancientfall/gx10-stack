@@ -48,10 +48,10 @@
     background-attachment: fixed;
     padding: 28px 20px 60px;
   }
-  /* translucent "vibrancy" on the main surfaces */
-  .fabric, .card, .pane, .metric, .nstat, .modal, .logpane, .engpane, .imgpane,
-  .storage-bar, .now-serving, .latcard, .latextra, .benchpane, .chart, .costcard,
-  .dlbanner, .mcard, .libitem, .pg-bar { backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%); }
+  /* translucent "vibrancy" — selective, only on prominent floating surfaces
+     (broad backdrop-filter on every card/list item is GPU-expensive and janks
+     the page). Most surfaces use a semi-transparent fill for depth, no blur. */
+  .fabric, .now-serving, .dlbanner { backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%); }
   .wrap { max-width: 1040px; margin: 0 auto; }
 
   header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
