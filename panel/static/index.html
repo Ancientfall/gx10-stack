@@ -543,6 +543,7 @@
   <nav class="tabbar" role="tablist">
     <button class="tab active" data-tab="monitor" role="tab">Monitor</button>
     <button class="tab" data-tab="serve" role="tab">Serve</button>
+    <button class="tab" data-tab="playground" role="tab">Playground</button>
     <button class="tab" data-tab="manage" role="tab">Manage</button>
     <div class="engine-toggle" id="engine-toggle" title="Active engine">
       <span class="et-label">Engine</span>
@@ -768,7 +769,6 @@
     <button class="mtab" id="tab-search" role="tab">Discover</button>
     <button class="mtab" id="tab-library" role="tab">Library</button>
     <button class="mtab" id="tab-nas" role="tab">NAS Archive</button>
-    <button class="mtab" id="tab-playground" role="tab">Playground</button>
   </div>
 
   <div class="mpane" id="pane-curated">
@@ -816,7 +816,9 @@
     <div class="mlist" id="nas-list"></div>
   </div>
 
-  <div class="mpane hidden" id="pane-playground">
+  </div><!-- /pane-serve -->
+
+  <div class="tabpane" id="pane-playground">
     <div class="pg-bar">
       <div class="pg-stat"><span class="pg-k">TTFT</span><span class="pg-v" id="pg-ttft">--</span></div>
       <div class="pg-stat"><span class="pg-k">Speed</span><span class="pg-v" id="pg-tps">--</span></div>
@@ -839,7 +841,6 @@
       </div>
     </div>
   </div>
-  </div><!-- /pane-serve -->
 
 </div>
 
@@ -1686,7 +1687,7 @@ $("pg-clear").onclick = () => {
 };
 
 // tab switching
-const tabs = { curated: "pane-curated", search: "pane-search", library: "pane-library", nas: "pane-nas", playground: "pane-playground" };
+const tabs = { curated: "pane-curated", search: "pane-search", library: "pane-library", nas: "pane-nas" };
 Object.keys(tabs).forEach((k) => {
   $(`tab-${k}`).onclick = () => {
     Object.keys(tabs).forEach((j) => {
@@ -1695,7 +1696,6 @@ Object.keys(tabs).forEach((k) => {
     });
     if (k === "library") loadLibrary();
     if (k === "nas") loadNas();
-    if (k === "playground") pgRefreshModel();
   };
 });
 
@@ -2049,9 +2049,10 @@ const ensureEngineLogs = () => {
 const TAB_PANES = {
   monitor: ["pane-monitor", "pane-monitor-history"],
   serve: ["pane-serve"],
+  playground: ["pane-playground"],
   manage: ["pane-manage"],
 };
-const allPanes = ["pane-monitor", "pane-monitor-history", "pane-serve", "pane-manage"];
+const allPanes = ["pane-monitor", "pane-monitor-history", "pane-serve", "pane-playground", "pane-manage"];
 const switchTab = (name) => {
   allPanes.forEach((p) => { const el = $(p); if (el) el.classList.remove("active"); });
   (TAB_PANES[name] || []).forEach((p) => { const el = $(p); if (el) el.classList.add("active"); });
@@ -2063,6 +2064,7 @@ document.querySelectorAll(".tab").forEach((t) => {
     switchTab(name);
     if (name === "manage") ensureImageOverview();
     if (name === "serve") ensureEngineLogs();
+    if (name === "playground") pgRefreshModel();
   };
 });
 switchTab("monitor");
