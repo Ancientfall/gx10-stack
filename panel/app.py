@@ -64,7 +64,7 @@ DFLASH_CONTAINER = "vllm-dflash"
 DFLASH_PAIRS = {"Qwen/Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash"}
 
 PANEL_HOST = os.environ.get("GX10_PANEL_HOST", "0.0.0.0")
-PANEL_PORT = int(os.environ.get("GX10_PANEL_PORT", "8080"))
+PANEL_PORT = int(os.environ.get("GX10_PANEL_PORT", "8090"))  # 8080 is commonly Open WebUI
 
 # Fields exposed in the config editor and their casts
 CONFIG_FIELDS = {
@@ -2765,10 +2765,30 @@ def api_image_switch(payload: dict = Body(...)):
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+def _pick_port(preferred: int, host: str) -> int:
+    """Bind the preferred port, or the next free fallback if it's taken (e.g. the
+    systemd unit hands us 8080 but Open WebUI already has it). Keeps the panel from
+    crash-looping on a port conflict and logs where it actually landed."""
+    import socket
+    bind_host = "" if host in ("0.0.0.0", "::", "") else host
+    for p in dict.fromkeys([preferred, 8090, 8091, 8092, 8190]):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((bind_host, p))
+            s.close()
+            return p
+        except OSError:
+            s.close()
+    return preferred
+
+
 if __name__ == "__main__":
     import uvicorn
     log_line(f"Panel starting. Kit dir: {KIT_DIR}")
     db_init()
     threading.Thread(target=_collector_loop, daemon=True).start()
     log_line(f"Metrics collector started (db: {DB_PATH.name}, cost rate ${COST_PER_MTOK}/Mtok)")
-    uvicorn.run(app, host=PANEL_HOST, port=PANEL_PORT, log_level="warning")
+    port = _pick_port(PANEL_PORT, PANEL_HOST)
+    if port != PANEL_PORT:
+        log_line(f"Port {PANEL_PORT} is in use; serving the panel on {port} instead.")
+    uvicorn.run(app, host=PANEL_HOST, port=port, log_level="warning")

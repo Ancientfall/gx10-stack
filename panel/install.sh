@@ -71,7 +71,7 @@ rm -f "${SUDO_FILE}"
 # ------------------------------------------------------------
 log "Installing systemd service"
 UNIT="/tmp/gx10-panel.service"
-PANEL_PORT="${GX10_PANEL_PORT:-8080}"
+PANEL_PORT="${GX10_PANEL_PORT:-8090}"   # 8080 is commonly taken by Open WebUI
 sed -e "s#__USER__#${PANEL_USER}#g" \
     -e "s#__DIR__#${DIR}#g" \
     -e "s#__KIT_DIR__#${KIT_DIR}#g" \
