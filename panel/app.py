@@ -2707,6 +2707,57 @@ def api_chat(payload: dict = Body(...)):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# ------------------------------------------------------------
+# OpenAI-compatible passthrough: one stable endpoint that always forwards to
+# whichever engine is live (vLLM :8000 or llama.cpp :8001). Point Open WebUI at
+# http://localhost:<panel-port>/v1 as a single OpenAI connection and it always
+# sees the current model — no per-engine connection juggling.
+# ------------------------------------------------------------
+@app.get("/v1/models")
+def v1_models():
+    eng = active_engine()
+    port = eng.get("port")
+    if not port:
+        return JSONResponse({"object": "list", "data": []})
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/v1/models", timeout=10) as r:
+            return JSONResponse(json.loads(r.read()))
+    except Exception:
+        return JSONResponse({"object": "list", "data": []})
+
+
+@app.post("/v1/chat/completions")
+def v1_chat_completions(payload: dict = Body(...)):
+    eng = active_engine()
+    port = eng.get("port")
+    if not port:
+        return JSONResponse(
+            {"error": {"message": "No model is serving. Load one from the GX10 panel.",
+                       "type": "service_unavailable"}}, status_code=503)
+    body = json.dumps(payload).encode()
+    import urllib.request, urllib.error
+    req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions",
+                                 data=body, headers={"Content-Type": "application/json"})
+    if payload.get("stream"):
+        def gen():
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    for raw in resp:
+                        yield raw
+            except Exception as e:
+                yield ("data: " + json.dumps({"error": str(e)[:200]}) + "\n\n").encode()
+        return StreamingResponse(gen(), media_type="text/event-stream")
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return JSONResponse(json.loads(resp.read()))
+    except urllib.error.HTTPError as e:
+        return JSONResponse({"error": {"message": e.read().decode("utf-8", "ignore")[:300]}},
+                            status_code=e.code)
+    except Exception as e:
+        return JSONResponse({"error": {"message": str(e)[:200]}}, status_code=502)
+
+
 @app.get("/api/engine/active")
 def api_engine_active():
     return JSONResponse(cached("engine_active", 3.0, active_engine))
