@@ -1085,7 +1085,8 @@ def _benchmark_worker(concurrency: int, prompt: str, max_tokens: int):
     total_toks = sum(r[1] for r in results)
     avg_ttft = round(sum(ttfts) / len(ttfts) * 1000, 1) if ttfts else None
     agg_tps = round(total_toks / duration, 1) if duration > 0 else None
-    summary = {"model": model, "concurrency": concurrency, "requests": len(results),
+    engine = eng.get("engine") or ""
+    summary = {"model": model, "engine": engine, "concurrency": concurrency, "requests": len(results),
                "ttft_ms": avg_ttft, "tps": agg_tps, "total_tokens": total_toks,
                "duration_s": round(duration, 2), "max_tokens": max_tokens}
     try:
@@ -1094,7 +1095,7 @@ def _benchmark_worker(concurrency: int, prompt: str, max_tokens: int):
                 "INSERT OR REPLACE INTO benchmarks (ts,model,concurrency,prompt_tokens,"
                 "max_tokens,ttft_ms,tps,total_tokens,duration_s,notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (int(time.time()), model, concurrency, len(prompt.split()), max_tokens,
-                 avg_ttft, agg_tps, total_toks, round(duration, 2), ""))
+                 avg_ttft, agg_tps, total_toks, round(duration, 2), engine))
             con.commit()
     except Exception:
         pass
@@ -1344,7 +1345,117 @@ def _set_dl(_jid=None, **kw):
 
 def download_status() -> dict:
     with _download_lock:
-        return dict(_download)
+        d = dict(_download)
+    d["queued"] = pure_download_status()   # the parallel pre-download lane (if any)
+    return d
+
+
+# ------------------------------------------------------------
+# Parallel download lane: a pure weight download (no auto-load) runs here, fully
+# independent of the single serving-job slot, so you can pre-download a model while
+# another is serving. It only fetches weights into the cache — never touches the
+# running engine. One background download at a time (its own slot + generation).
+# ------------------------------------------------------------
+_pd = {"active": False, "model": None, "status": "idle", "percent": 0,
+       "detail": "", "speed": "", "started": None, "error": None}
+_pd_lock = threading.Lock()
+_pd_proc = None
+_pd_gen = 0
+
+
+def pure_download_status() -> dict:
+    with _pd_lock:
+        return dict(_pd)
+
+
+def _pd_set(gen=None, **kw):
+    with _pd_lock:
+        if gen is not None and gen != _pd_gen:   # cancelled/superseded: drop the write
+            return
+        _pd.update(kw)
+
+
+def _pure_download_worker(model: str, gen: int):
+    global _pd_proc
+    token = cfg().get("HF_TOKEN", "")
+    _pd_set(gen, active=True, model=model, status="downloading", percent=0,
+            detail=f"Downloading {model}...", speed="", error=None, started=time.time())
+    log_line(f"[queue] downloading {model} (parallel lane)")
+    proc = subprocess.Popen(_hf_download_command(model, token),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    with _pd_lock:
+        _pd_proc = proc
+    last_pct, saw_error = 0, None
+    pat_pct = re.compile(r'(\d+)%')
+    pat_speed = re.compile(r'([\d.]+[KMG]B/s)')
+    tail = collections.deque(maxlen=8)
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        tail.append(line)
+        low = line.lower()
+        if "401" in line or "gated" in low or "restricted" in low or "authentication" in low:
+            saw_error = "Model is gated. Set HF_TOKEN in cluster.env and request access on Hugging Face."
+        elif "404" in line or "not found" in low:
+            saw_error = "Model not found. Check the exact repo id."
+        elif "no space left" in low:
+            saw_error = "Out of disk space in the cache volume."
+        elif "no such container" in low or "error response from daemon" in low:
+            saw_error = f"Download container error: {line[:160]}"
+        m = pat_pct.search(line)
+        if m:
+            pct = int(m.group(1))
+            if pct >= last_pct:
+                last_pct = pct
+                sp = pat_speed.search(line)
+                _pd_set(gen, percent=pct, status="downloading", detail=f"Downloading {model}",
+                        speed=sp.group(1) if sp else "")
+    proc.wait()
+    with _pd_lock:
+        if _pd_proc is proc:
+            _pd_proc = None
+    if saw_error or proc.returncode != 0:
+        msg = saw_error or f"Download failed (exit {proc.returncode}): {' / '.join(list(tail)[-3:])[:200]}"
+        _pd_set(gen, active=False, status="error", error=msg, detail=msg)
+        log_line(f"[queue] FAILED {model}: {msg}")
+        return
+    _pd_set(gen, active=False, percent=100, status="downloaded",
+            detail=f"{model} downloaded — load it from the Library.")
+    log_line(f"[queue] complete {model}")
+    invalidate_cache("library")
+
+
+def start_pure_download(model: str) -> dict:
+    """Queue a background, no-load download. Runs alongside whatever is serving."""
+    global _pd_gen
+    with _pd_lock:
+        if _pd["active"]:
+            return {"ok": False, "detail": f"Already downloading {_pd.get('model')} in the background — one at a time."}
+        _pd_gen += 1
+        gen = _pd_gen
+        _pd.update(active=True, model=model, status="downloading", percent=0,
+                   detail=f"Queued {model}...", speed="", error=None, started=time.time())
+    try:
+        threading.Thread(target=_pure_download_worker, args=(model, gen), daemon=True).start()
+    except Exception as e:
+        _pd_set(active=False, status="error", error=str(e))
+        return {"ok": False, "detail": f"Could not start download: {e}"}
+    return {"ok": True, "detail": f"Downloading {model} in the background. Load it from the Library when ready."}
+
+
+def cancel_pure_download() -> dict:
+    global _pd_proc, _pd_gen
+    with _pd_lock:
+        _pd_gen += 1                 # drop any further writes from the running worker
+        proc, _pd_proc = _pd_proc, None
+        _pd.update(active=False, status="idle", model=None, percent=0, detail="", error=None)
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return {"ok": True, "detail": "Background download cancelled."}
 
 
 def _start_vllm(model: str, max_len_override: int = None) -> tuple:
@@ -1639,6 +1750,10 @@ def start_download(model: str, auto_load: bool = True):
         model = _validate_hf_repo_id(model, "model")
     except ValueError as e:
         return {"ok": False, "detail": str(e)}
+    # A pure download (no auto-load) goes to the parallel lane so it never blocks —
+    # nor is blocked by — whatever is serving. Loads still take the serving slot.
+    if not auto_load:
+        return start_pure_download(model)
     jid, busy = _claim_job(model, status="downloading", detail=f"Preparing to download {model}...")
     if jid is None:
         return {"ok": False, "detail": busy}
@@ -2972,6 +3087,11 @@ def api_download_status():
 @app.post("/api/download/dismiss")
 def api_download_dismiss():
     return JSONResponse(dismiss_status())
+
+
+@app.post("/api/download/queue/cancel")
+def api_download_queue_cancel():
+    return JSONResponse(cancel_pure_download())
 
 
 @app.post("/api/model/preload-check")
