@@ -400,8 +400,34 @@ def _iface_speed_mtu(iface: str):
     return speed, mtu
 
 
+def detect_fabric_links() -> dict:
+    """Auto-detect ConnectX-class fabric NICs (>=100G) and their link state, by
+    reading /sys/class/net. Works even when CX7_IFACE is unset in cluster.env."""
+    ports = []
+    for p in sorted(glob.glob("/sys/class/net/*/speed")):
+        d = Path(p).parent
+        try:
+            speed = int(Path(p).read_text().strip())
+        except Exception:
+            continue
+        if speed < 100000:  # fabric-class only; skips eth/docker/veth
+            continue
+        try:
+            oper = (d / "operstate").read_text().strip()
+        except Exception:
+            oper = "?"
+        ports.append({"iface": d.name, "speed_mbps": speed, "up": oper == "up"})
+    up = [x for x in ports if x["up"]]
+    per = (up[0]["speed_mbps"] if up else (ports[0]["speed_mbps"] if ports else None))
+    return {"ports": ports, "ports_up": len(up), "ports_total": len(ports),
+            "per_port_gbps": round(per / 1000) if per else None}
+
+
 def check_link(c) -> dict:
-    iface = c.get("CX7_IFACE", "enp1s0f1np1")
+    iface = c.get("CX7_IFACE") or ""
+    if not iface:  # cluster.env may leave it blank; fall back to auto-detection
+        up = [x for x in detect_fabric_links()["ports"] if x["up"]]
+        iface = up[0]["iface"] if up else "enp1s0f1np1"
     rc, out, _ = run("ibdev2netdev")
     up = False
     if rc == 0:
@@ -593,6 +619,7 @@ def _vllm_serving(body: str) -> dict:
     """Rich serving metrics from a vLLM /metrics body."""
     kv = _parse_prom(body, "vllm:gpu_cache_usage_perc")
     return {
+        "tps_gauge": None,  # vLLM has no stable instant-throughput gauge; UI uses counter deltas
         "gen_tokens_total": _parse_prom(body, "vllm:generation_tokens_total"),
         "prompt_tokens_total": _parse_prom(body, "vllm:prompt_tokens_total"),
         "requests_running": _parse_prom(body, "vllm:num_requests_running"),
@@ -617,7 +644,11 @@ def _llama_serving(body: str) -> dict:
     none4 = {"avg_ms": None, "p50_ms": None, "p95_ms": None, "p99_ms": None}
     itl_avg = round(pred_secs / gen * 1000, 1) if (gen and pred_secs) else None
     ttft_avg = round(prompt_secs / n_decode * 1000, 1) if (n_decode and prompt_secs) else None
+    # llama.cpp publishes an instantaneous generation-rate gauge; use it directly so
+    # throughput reflects real output rate instead of noisy counter deltas.
+    tps_gauge = _parse_prom(body, "llamacpp:predicted_tokens_seconds")
     return {
+        "tps_gauge": round(tps_gauge, 1) if tps_gauge is not None else None,
         "gen_tokens_total": gen,
         "prompt_tokens_total": _parse_prom(body, "llamacpp:prompt_tokens_total"),
         "requests_running": _parse_prom(body, "llamacpp:requests_processing"),
@@ -709,7 +740,11 @@ def gather_metrics() -> dict:
         return stats
 
     out["nodes"]["head"] = node_stats(local=True)
-    out["nodes"]["worker"] = node_stats(local=False)
+    # the worker readout is an SSH round-trip (~0.7s) and changes slowly, so cache it
+    # longer than the local stats — keeps live telemetry snappy without stale worker data.
+    out["nodes"]["worker"] = cached("worker_stats", 6.0, lambda: node_stats(local=False))
+    # physical fabric link speed (read locally from /sys; cheap)
+    out["fabric"] = detect_fabric_links()
     return out
 
 
@@ -751,7 +786,7 @@ def gather_telemetry() -> dict:
     """Live telemetry snapshot for the Telemetry tab: latency blocks (TTFT/ITL/e2e/
     queue, avg + p50/p95/p99), KV-cache %, queue depth, success counts, and recent
     tokens/sec. Reuses the cached metrics fetch + the latest collector sample."""
-    m = cached("metrics", 2.5, gather_metrics)
+    m = cached("metrics", 1.5, gather_metrics)
     serving = m.get("serving", {}) or {}
     tps = None
     try:
@@ -2130,7 +2165,7 @@ def api_status():
 
 @app.get("/api/metrics")
 def api_metrics():
-    return JSONResponse(cached("metrics", 2.5, gather_metrics))
+    return JSONResponse(cached("metrics", 1.5, gather_metrics))
 
 
 @app.get("/api/activity")
@@ -2441,7 +2476,7 @@ def api_cost():
 
 @app.get("/api/telemetry")
 def api_telemetry():
-    return JSONResponse(cached("telemetry", 2.0, gather_telemetry))
+    return JSONResponse(cached("telemetry", 1.5, gather_telemetry))
 
 
 @app.get("/api/telemetry/history")
