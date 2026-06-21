@@ -1468,8 +1468,8 @@ def _start_vllm(model: str, max_len_override: int = None) -> tuple:
     max_len = _validate_int_range(max_len_override if max_len_override else c["MAX_MODEL_LEN"],
                                   "MAX_MODEL_LEN", 512, 1048576)
     if CONTAINER not in _running_container_names():
-        return (127, "", "The multi-node vLLM cluster isn't running. Click Start to bring it up, then "
-                         "load this model — or pick a GGUF model to run single-node on llama.cpp.")
+        return (127, "", "The vLLM cluster container isn't running and couldn't be auto-started. "
+                         "Check the activity log, or pick a GGUF model to run single-node on llama.cpp.")
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
@@ -1672,6 +1672,8 @@ def _download_worker(model: str, auto_load: bool, jid=None):
         write_env_value(CLUSTER_ENV, "MODEL", model)
         _set_dl(_jid=jid, active=True, status="loading", detail=f"Starting {model} on the cluster...")
         log_line(f"[model] auto-loading {model}")
+        if not _ensure_cluster_up(jid):   # auto-provision the cluster if it isn't up
+            return
         rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
         if rc != 0:
             _set_dl(_jid=jid, active=False, status="error", error=f"Load failed: {err}")
@@ -1693,6 +1695,61 @@ def currently_serving() -> str:
     return ""
 
 
+def _ensure_cluster_up(jid=None, timeout_s=300) -> bool:
+    """Auto-provision the multi-node vLLM cluster for a vLLM load. If its container
+    isn't running, start it idle (NO_AUTOLOAD) and wait for it to come up, so loading
+    a vLLM model 'just works' without the user having to click Start first. Streams
+    launch output to the activity log, guards against a concurrent Start/Stop, and
+    honors cancellation. Returns True once the cluster container is running."""
+    if CONTAINER in _running_container_names():
+        return True
+    if not LAUNCH_SCRIPT.exists():
+        _set_dl(_jid=jid, active=False, status="error",
+                error="Cluster launch script not found. Set GX10_KIT_DIR.",
+                detail="Cluster launch script not found.")
+        return False
+    if not _action_lock.acquire(blocking=False):
+        _set_dl(_jid=jid, active=False, status="error",
+                error=f"A cluster action ({_current_action['name'] or 'busy'}) is already running. Try again shortly.")
+        return False
+    _current_action["name"] = "starting"
+    try:
+        _set_dl(_jid=jid, active=True, status="loading",
+                detail="Auto-starting the vLLM cluster on both nodes (~1 min)...")
+        log_line("[engine] auto-starting the multi-node vLLM cluster for a vLLM load")
+        env = dict(os.environ)
+        env["NO_AUTOLOAD"] = "1"
+        proc = subprocess.Popen(["bash", str(LAUNCH_SCRIPT)], cwd=str(KIT_DIR), text=True,
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in proc.stdout:
+            if line.strip():
+                log_line(line.rstrip())
+            if jid is not None and not _job_is_current(jid):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return False
+        proc.wait()
+    except Exception as e:
+        _set_dl(_jid=jid, active=False, status="error", error=f"Cluster start failed: {e}")
+        return False
+    finally:
+        _current_action["name"] = None
+        _action_lock.release()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if CONTAINER in _running_container_names():
+            log_line("[engine] cluster is up; continuing the load")
+            return True
+        if jid is not None and not _job_is_current(jid):
+            return False
+        time.sleep(2)
+    _set_dl(_jid=jid, active=False, status="error",
+            error="The cluster didn't come up in time. Check the activity log, then try Start.")
+    return False
+
+
 def _load_worker(model: str, jid=None):
     """Load a cached model with rollback: if it fails, restore the previous one."""
     try:
@@ -1705,6 +1762,12 @@ def _load_worker(model: str, jid=None):
     _set_dl(_jid=jid, active=True, model=model, status="loading", percent=0,
             detail=f"Starting {model}...", speed="", error=None, started=time.time())
     log_line(f"[model] loading {model}" + (f" (was {previous})" if previous else ""))
+    # auto-start the cluster if it isn't up, so a vLLM load doesn't dead-end on
+    # "cluster isn't running" — the user expects loading to provision the engine.
+    if not _ensure_cluster_up(jid):
+        if not previous:
+            write_env_value(CLUSTER_ENV, "MODEL", "")
+        return
     rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
     if rc != 0:
         if not previous:
@@ -1819,8 +1882,7 @@ def preload_check(model: str) -> dict:
         if has_dflash:
             notes.append("Has a DFlash draft: serves single-node with speculative decoding (no cluster needed).")
         elif CONTAINER not in _running_container_names():
-            warnings.append("The multi-node vLLM cluster isn't running. Start it first or this load will fail. "
-                            "(GGUF models run single-node on llama.cpp without the cluster.)")
+            notes.append("The vLLM cluster isn't running — it will auto-start on both nodes first (~1 min), then load.")
     # known-risky formats, only a concern on vLLM
     if engine == "vllm" and ("nvfp4" in low or "fp4" in low):
         warnings.append("NVFP4 is a newer 4-bit format; this vLLM build may not support it. "
