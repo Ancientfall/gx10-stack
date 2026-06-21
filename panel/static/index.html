@@ -1840,7 +1840,7 @@ document.querySelectorAll(".hwin").forEach((b) => {
 });
 
 loadCost(); loadHistory();
-setInterval(() => { loadCost(); loadHistory(); }, 15000);
+setInterval(() => { if (!document.hidden) { loadCost(); loadHistory(); } }, 15000);
 
 // ---------- vLLM version / image manager ----------
 const loadImageOverview = async () => {
@@ -1935,12 +1935,10 @@ const ensureImageOverview = () => {
   imageOverviewLoaded = true;
   loadImageOverview();
 };
-setInterval(pollImage, 2500);
+setInterval(() => { if (!document.hidden) pollImage(); }, 2500);
 
 // ---------- engines: vLLM vs llama.cpp ----------
-const pollEngines = async () => {
-  let a;
-  try { a = await api("/api/engine/active"); } catch (e) { return; }
+const renderEngines = (a) => {
   const vllmActive = a.engine === "vllm";
   const llamaActive = a.engine === "llamacpp";
   $("eng-vllm").classList.toggle("eng-active", vllmActive);
@@ -1962,6 +1960,7 @@ const pollEngines = async () => {
     }
   }
 };
+const pollEngines = async () => { try { renderEngines(await api("/api/engine/active")); } catch (e) {} };
 
 $("ll-load").onclick = async () => {
   const repo = $("ll-repo").value.trim();
@@ -2001,8 +2000,7 @@ $("engine-stop").onclick = async () => {
   }, { errorPrefix: "Stop failed" });
 };
 
-pollEngines();
-setInterval(pollEngines, 5000);
+pollEngines();   // initial paint; live updates arrive via the SSE "engine" event
 
 // ---------- engine logs (Serve tab) ----------
 let logEngine = "vllm";
@@ -2080,9 +2078,7 @@ document.querySelectorAll(".et-opt").forEach((b) => {
 });
 
 // ---------- now-serving status line (Monitor home) ----------
-const updateNowServing = async () => {
-  let a;
-  try { a = await api("/api/engine/active"); } catch (e) { return; }
+const renderNowServing = (a) => {
   const dot = $("ns-dot"), sum = $("ns-summary");
   if (a.engine) {
     dot.className = "ns-dot live";
@@ -2093,8 +2089,7 @@ const updateNowServing = async () => {
     sum.textContent = "Nothing serving. Load a model from the Serve tab.";
   }
 };
-updateNowServing();
-setInterval(updateNowServing, 5000);
+const updateNowServing = async () => { try { renderNowServing(await api("/api/engine/active")); } catch (e) {} };
 
 const tick = () => { $("clock").textContent = new Date().toLocaleTimeString(); };
 
@@ -2124,9 +2119,7 @@ const setGauge = (fillId, pctId, value, isMem, total) => {
   pct.textContent = label;
 };
 
-const pollMetrics = async () => {
-  let m;
-  try { m = await api("/api/metrics"); } catch (e) { return; }
+const renderMetrics = (m) => {
   const s = m.serving || {};
   // throughput: prefer the engine's instant gauge (llama.cpp), else counter delta
   const now = Date.now();
@@ -2159,6 +2152,7 @@ const pollMetrics = async () => {
   setNe("ns-head-power", h.power); setNe("ns-head-temp", h.temp); setNe("ns-head-clk", h.clock_sm);
   setNe("ns-worker-power", w.power); setNe("ns-worker-temp", w.temp); setNe("ns-worker-clk", w.clock_sm);
 };
+const pollMetrics = async () => { try { renderMetrics(await api("/api/metrics")); } catch (e) {} };
 
 // ---------- detailed request-latency telemetry ----------
 const fmtMs = (v) => (v == null ? "--" : (v >= 1000 ? (v / 1000).toFixed(2) + "s" : Math.round(v) + "ms"));
@@ -2174,9 +2168,7 @@ const setLat = (key, blk, llama) => {
   $(`lat-${key}-p95`).textContent = cell(blk.p95_ms, pctNa);
   $(`lat-${key}-p99`).textContent = cell(blk.p99_ms, pctNa);
 };
-const pollTelemetry = async () => {
-  let t;
-  try { t = await api("/api/telemetry"); } catch (e) { return; }
+const renderTelemetry = (t) => {
   const s = t.serving || {};
   const llama = t.engine === "llamacpp";
   setLat("ttft", s.ttft, llama); setLat("itl", s.itl, llama); setLat("e2e", s.e2e, llama); setLat("queue", s.queue, llama);
@@ -2185,6 +2177,7 @@ const pollTelemetry = async () => {
   const eng = llama ? "llama.cpp" : t.engine === "vllm" ? "vLLM" : "idle";
   $("lat-engine").textContent = s.metrics_unavailable ? eng + " (no metrics)" : eng;
 };
+const pollTelemetry = async () => { try { renderTelemetry(await api("/api/telemetry")); } catch (e) {} };
 
 // ---------- benchmark runner ----------
 let benchTimer = null;
@@ -2250,9 +2243,7 @@ $("bench-run").onclick = async () => {
 
 // ---------- job lifecycle banner (download -> load -> compile -> ready) ----------
 const ACTIVE_STATES = ["downloading", "loading", "loading weights", "compiling", "downloading weights", "copying"];
-const pollDownload = async () => {
-  let d;
-  try { d = await api("/api/download/status"); } catch (e) { return; }
+const renderDownload = (d) => {
   const banner = $("dl-banner");
   const isActive = d.active || ACTIVE_STATES.includes(d.status);
   const isDone = d.status === "ready" || d.status === "error" || d.status === "downloaded";
@@ -2289,6 +2280,7 @@ const pollDownload = async () => {
 
   if (d.status === "ready") { setTimeout(() => { loadCurated(); pollStatus(); }, 600); }
 };
+const pollDownload = async () => { try { renderDownload(await api("/api/download/status")); } catch (e) {} };
 
 $("dl-dismiss").onclick = async () => {
   try { await api("/api/download/dismiss", "POST"); }
@@ -2333,14 +2325,46 @@ $("btn-unload").onclick = async () => {
   }, { errorPrefix: "Unload failed" });
 };
 
-tick(); pollStatus(); pollActivity(); pollMetrics(); pollDownload();
-pollTelemetry(); loadBenchHistory(); pollBenchStatus();  // resume a running benchmark if one is in flight
-setInterval(tick, 1000);
-setInterval(pollStatus, 4000);
-setInterval(pollActivity, 3000);
-setInterval(pollMetrics, 2000);
-setInterval(pollTelemetry, 2000);
-setInterval(pollDownload, 2000);
+// ---------- real-time stream: one EventSource replaces the hot pollers ----------
+let _es = null, _esRetry = 0;
+const SSE_HANDLERS = {
+  download: renderDownload,
+  activity: (d) => renderActivity(d.lines),
+  engine: (d) => { renderNowServing(d); renderEngines(d); },
+  metrics: renderMetrics,
+  telemetry: renderTelemetry,
+  status: renderStatus,
+};
+const startStream = () => {
+  if (_es || document.hidden || typeof EventSource === "undefined") return;
+  try {
+    _es = new EventSource("/api/stream");
+    Object.keys(SSE_HANDLERS).forEach((ev) =>
+      _es.addEventListener(ev, (e) => { try { SSE_HANDLERS[ev](JSON.parse(e.data)); } catch (_) {} }));
+    _es.onopen = () => { _esRetry = 0; };
+    _es.onerror = () => {
+      // EventSource auto-reconnects on transient drops; only intervene if fully closed
+      if (_es && _es.readyState === 2) { _es = null; setTimeout(startStream, Math.min(1000 * ++_esRetry, 8000)); }
+    };
+  } catch (e) { _es = null; }
+};
+const stopStream = () => { if (_es) { _es.close(); _es = null; } };
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopStream();
+  else { startStream(); pollStatus(); pollMetrics(); pollDownload(); updateNowServing(); }  // instant catch-up
+});
+
+// initial paint (immediate), then the stream takes over live updates
+tick(); pollStatus(); pollActivity(); pollMetrics(); pollTelemetry(); pollDownload();
+loadBenchHistory(); pollBenchStatus();   // resume a running benchmark if one is in flight
+setInterval(tick, 1000);                 // local clock only
+startStream();
+// safety net: if the stream is down (proxy buffering, unsupported), fall back to polling
+setInterval(() => {
+  if (!_es || _es.readyState !== 1) {
+    pollStatus(); pollActivity(); pollMetrics(); pollTelemetry(); pollDownload(); updateNowServing(); pollEngines();
+  }
+}, 20000);
 </script>
 </body>
 </html>

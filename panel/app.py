@@ -15,6 +15,7 @@ import glob
 import time
 import json
 import shlex
+import asyncio
 import sqlite3
 import threading
 import subprocess
@@ -2588,6 +2589,52 @@ def api_metrics():
 def api_activity():
     with _activity_lock:
         return JSONResponse({"lines": list(_activity)})
+
+
+def _sse(event: str, data) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+@app.get("/api/stream")
+async def api_stream(request: Request):
+    """One Server-Sent-Events stream that pushes download/job progress, the activity
+    log, engine state, metrics, telemetry, and status — replacing the browser's many
+    polling loops. Snapshots reuse the same TTL caches as the REST endpoints, and
+    blocking gathers run in the threadpool so the event loop stays free. The browser
+    opens one EventSource and pauses it when the tab is hidden."""
+    async def gen():
+        last_act = None
+        tick = 0
+        yield b": connected\n\n"   # prime the stream so the client fires `open`
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                yield _sse("download", download_status())
+                with _activity_lock:
+                    acts = list(_activity)
+                sig = (len(acts), acts[-1]["t"] if acts else None,
+                       acts[-1]["line"] if acts else None)
+                if sig != last_act:                 # only push the log when it changed
+                    last_act = sig
+                    yield _sse("activity", {"lines": acts})
+                yield _sse("engine", await run_in_threadpool(
+                    lambda: cached("engine_active", 3.0, active_engine)))
+                if tick % 2 == 0:                   # metrics/telemetry every ~2s
+                    yield _sse("metrics", await run_in_threadpool(
+                        lambda: cached("metrics", 1.5, gather_metrics)))
+                    yield _sse("telemetry", await run_in_threadpool(
+                        lambda: cached("telemetry", 1.5, gather_telemetry)))
+                if tick % 4 == 0:                   # status every ~4s
+                    yield _sse("status", await run_in_threadpool(
+                        lambda: cached("status", 3.0, gather_status)))
+            except Exception as e:
+                yield _sse("error", {"message": str(e)[:160]})
+            tick += 1
+            await asyncio.sleep(1.0)
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/start")
