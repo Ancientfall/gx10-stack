@@ -18,6 +18,15 @@ if [[ "${1:-}" != "--no-worker" && -n "${WH}" ]]; then
     ssh -o ConnectTimeout=10 "${WH}" "cd ~/gx10-stack && git pull --ff-only" || log "worker pull failed (continuing)"
 fi
 
+# Keep the panel venv in sync with requirements.txt before restarting, so a new
+# dependency (e.g. httpx) can't crash-loop the service on the next start.
+PANEL_VENV="${HERE}/panel/.venv"
+if [[ -x "${PANEL_VENV}/bin/pip" ]]; then
+    log "Sync panel deps"
+    "${PANEL_VENV}/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    "${PANEL_VENV}/bin/pip" install --quiet -r "${HERE}/panel/requirements.txt" || log "pip install reported an error (continuing)"
+fi
+
 log "Restart panel"
 sudo -n systemctl restart gx10-panel.service 2>/dev/null || sudo systemctl restart gx10-panel.service
 sleep 2

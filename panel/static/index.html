@@ -134,9 +134,34 @@
   .console .l-error { color: var(--err); }
   .console .l-optimize { color: var(--fabric); }
   .console .l-model { color: var(--accent); }
-  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 11px 16px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; max-width: min(92vw, 520px); }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  .toast.error { background: #2a1413; border-color: #5a2a28; color: #f5a6a0; }
   .hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
+
+  /* ---------- confirmation modal (replaces native confirm/alert) ---------- */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(4, 7, 11, 0.66);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px; opacity: 0; transition: opacity .15s;
+  }
+  .modal-overlay[hidden] { display: none; }   /* author rule must beat .modal-overlay { display:flex } */
+  .modal-overlay.show { opacity: 1; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 20px 22px; width: 100%; max-width: 460px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+    transform: translateY(6px); transition: transform .15s;
+  }
+  .modal-overlay.show .modal { transform: translateY(0); }
+  .modal-title { font-size: 16px; font-weight: 600; color: var(--text); margin: 0 0 10px; }
+  .modal-body { font-size: 13.5px; color: var(--muted); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow-y: auto; margin-bottom: 18px; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-actions button { padding: 9px 18px; }
+  @media (prefers-reduced-motion: reduce) {
+    .modal-overlay, .modal { transition: none; }
+  }
 
   /* live telemetry strip */
   .telemetry { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
@@ -741,23 +766,167 @@
 
 <div class="toast" id="toast"></div>
 
+<div class="modal-overlay" id="modal-overlay" hidden>
+  <div class="modal" id="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
+    <h2 class="modal-title" id="modal-title"></h2>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel">Cancel</button>
+      <button id="modal-confirm" class="primary">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
+const escapeHtml = (str) => String(str ?? "").replace(/[&<>"']/g, (ch) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+}[ch]));
 const api = async (path, method = "GET", body = null) => {
   const opt = { method, headers: { "Content-Type": "application/json" } };
   if (body) opt.body = JSON.stringify(body);
   const res = await fetch(path, opt);
-  return res.json();
+  // Parse the body defensively: prefer JSON, fall back to raw text (some 500s
+  // return a plain stack trace / proxy error with no JSON body).
+  let data = null, text = "";
+  try { text = await res.text(); } catch (_) { text = ""; }
+  if (text) { try { data = JSON.parse(text); } catch (_) { data = null; } }
+  if (!res.ok) {
+    const detail = (data && (data.detail || data.error || data.message)) || text || `Request failed (${res.status})`;
+    const err = new Error(String(detail));
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+  return data != null ? data : {};
 };
-const toast = (msg) => {
+const toast = (msg, opts = {}) => {
   const el = $("toast");
   el.textContent = msg;
+  el.classList.toggle("error", !!opts.error);
   el.classList.add("show");
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove("show"), 3200);
+  el._t = setTimeout(() => el.classList.remove("show"), opts.error ? 4500 : 3200);
+};
+// Show the error toast for a thrown api() error (or any Error). Used by the
+// action handlers' catch blocks so failures look like failures, not successes.
+const toastError = (prefix, e) => {
+  const msg = (e && e.message) ? e.message : String(e || "Unknown error");
+  toast(prefix ? `${prefix}: ${msg}` : msg, { error: true });
+};
+
+// ---------- in-page confirmation modal (never blocks the JS thread) ----------
+// Replaces native confirm()/alert(). Returns a Promise<boolean>.
+//   const ok = await confirmModal({ title, body, confirmLabel, cancelLabel, danger });
+// Accessible: focuses the dialog, traps focus, Escape cancels, Enter confirms,
+// and restores focus to the element that was active when it opened.
+let _modalOpen = false;
+const confirmModal = ({ title = "Confirm", body = "", confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false } = {}) => {
+  // Guard against overlapping modals (e.g. a double-tap before the first resolves).
+  if (_modalOpen) return Promise.resolve(false);
+  _modalOpen = true;
+  const overlay = $("modal-overlay");
+  const dialog = $("modal-dialog");
+  const confirmBtn = $("modal-confirm");
+  const cancelBtn = $("modal-cancel");
+  const trigger = document.activeElement;
+
+  $("modal-title").textContent = title;
+  $("modal-body").textContent = body;          // textContent => safe with untrusted strings
+  confirmBtn.textContent = confirmLabel;
+  cancelBtn.textContent = cancelLabel;
+  confirmBtn.className = danger ? "danger" : "primary";
+
+  overlay.hidden = false;
+  // next frame so the .show transition runs
+  requestAnimationFrame(() => overlay.classList.add("show"));
+
+  return new Promise((resolve) => {
+    let done = false;
+    const focusable = () => [cancelBtn, confirmBtn].filter((b) => !b.disabled);
+
+    const close = (result) => {
+      if (done) return;
+      done = true;
+      overlay.classList.remove("show");
+      document.removeEventListener("keydown", onKey, true);
+      overlay.removeEventListener("mousedown", onOverlay);
+      confirmBtn.onclick = null;
+      cancelBtn.onclick = null;
+      const finish = () => {
+        overlay.hidden = true;
+        _modalOpen = false;
+        // restore focus to whatever opened the dialog
+        if (trigger && typeof trigger.focus === "function") {
+          try { trigger.focus(); } catch (_) {}
+        }
+        resolve(result);
+      };
+      // wait for the fade-out unless reduced motion is requested
+      if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) finish();
+      else setTimeout(finish, 160);
+    };
+
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(false); }
+      else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); close(true); }
+      else if (e.key === "Tab") {
+        // trap focus within the dialog
+        const items = focusable();
+        if (!items.length) { e.preventDefault(); return; }
+        const first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        else if (!dialog.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+      }
+    };
+    const onOverlay = (e) => { if (e.target === overlay) close(false); };
+
+    confirmBtn.onclick = () => close(true);
+    cancelBtn.onclick = () => close(false);
+    document.addEventListener("keydown", onKey, true);
+    overlay.addEventListener("mousedown", onOverlay);
+    // move focus into the dialog on open (Enter confirms / Escape cancels regardless)
+    requestAnimationFrame(() => { try { confirmBtn.focus(); } catch (_) {} });
+  });
 };
 
 const dotClass = (status) => ({ ok: "up", warn: "warn", error: "err", idle: "" }[status] || "");
+
+// Buttons whose request is currently in flight. renderStatus() consults this so
+// a status poll can't re-enable a button mid-action (P0-2: no double-submits).
+const inFlight = new Set();
+
+// Run a button action with optimistic in-flight feedback (disable + transient
+// label) that is always restored, plus uniform error toasting (P0-1 / P0-2).
+// `id` is the button element id; `busyLabel` the transient text; `fn` does the work.
+const runAction = async (id, busyLabel, fn, opts = {}) => {
+  const btn = $(id);
+  if (!btn || btn.disabled || inFlight.has(id)) return;
+  inFlight.add(id);
+  const original = btn.textContent;
+  btn.disabled = true;
+  if (busyLabel != null) btn.textContent = busyLabel;
+  try {
+    // fn may return false to signal "handled failure" and suppress successLabel
+    const ok = await fn();
+    if (opts.successLabel && ok !== false) {
+      // brief confirmation state (e.g. "Saved ✓") before restoring
+      btn.textContent = opts.successLabel;
+      await new Promise((r) => setTimeout(r, 900));
+    }
+  } catch (e) {
+    toastError(opts.errorPrefix || "Action failed", e);
+  } finally {
+    inFlight.delete(id);
+    btn.textContent = original;
+    btn.disabled = false;   // renderStatus will re-apply the correct enabled state next poll
+  }
+};
 
 let configLoaded = false;
 
@@ -790,17 +959,21 @@ const renderStatus = (s) => {
   // verdict
   const vd = $("verdict-dot"), vt = $("verdict-text");
   vd.className = "big dot " + dotClass(s.overall);
-  if (s.action) vt.innerHTML = `<span class="spin"></span>${s.action[0].toUpperCase() + s.action.slice(1)} the cluster...`;
+  if (s.action) {
+    const action = s.action[0].toUpperCase() + s.action.slice(1);
+    vt.innerHTML = `<span class="spin"></span>${escapeHtml(action)} the cluster...`;
+  }
   else if (s.overall === "ok" && s.running) vt.textContent = "Cluster healthy and serving.";
   else if (s.overall === "ok") vt.textContent = "Configuration good. Cluster idle.";
   else if (s.overall === "warn") vt.textContent = "Running with warnings. See checks below.";
   else vt.textContent = "Problems found. Review checks or run Optimize.";
 
-  // buttons reflect action state
+  // buttons reflect action state — but never re-enable a button whose own
+  // request is still in flight (optimistic disable must survive a poll tick).
   const busy = !!s.action;
-  $("btn-start").disabled = busy || s.running;
-  $("btn-stop").disabled = busy || !s.running;
-  $("btn-optimize").disabled = busy;
+  if (!inFlight.has("btn-start")) $("btn-start").disabled = busy || s.running;
+  if (!inFlight.has("btn-stop")) $("btn-stop").disabled = busy || !s.running;
+  if (!inFlight.has("btn-optimize")) $("btn-optimize").disabled = busy;
 
   // check cards
   const grid = $("checks");
@@ -808,7 +981,7 @@ const renderStatus = (s) => {
   s.checks.forEach((c) => {
     const div = document.createElement("div");
     div.className = "card " + c.status;
-    div.innerHTML = `<div class="label"><span class="dot ${dotClass(c.status)}"></span>${c.label}</div><div class="detail">${c.detail}</div>`;
+    div.innerHTML = `<div class="label"><span class="dot ${dotClass(c.status)}"></span>${escapeHtml(c.label)}</div><div class="detail">${escapeHtml(c.detail)}</div>`;
     grid.appendChild(div);
   });
 
@@ -840,7 +1013,7 @@ const renderActivity = (lines) => {
     if (x.line.includes("[error]") || x.line.toLowerCase().includes("fail")) cls = "l-error";
     else if (x.line.includes("[optimize]")) cls = "l-optimize";
     else if (x.line.includes("[model]") || x.line.includes("[config]")) cls = "l-model";
-    return `<div class="${cls}"><span class="t">${x.t}</span>${x.line.replace(/</g, "&lt;")}</div>`;
+    return `<div class="${cls}"><span class="t">${escapeHtml(x.t)}</span>${escapeHtml(x.line)}</div>`;
   }).join("");
   if (atBottom) c.scrollTop = c.scrollHeight;
 };
@@ -851,7 +1024,7 @@ const renderVllmLogs = async () => {
   try {
     const r = await api("/api/logs");
     c.innerHTML = `<div class="t">vLLM log tail · live</div>` +
-      r.log.replace(/</g, "&lt;").split("\n").map((l) => `<div>${l}</div>`).join("");
+      String(r.log || "").split("\n").map((l) => `<div>${escapeHtml(l)}</div>`).join("");
     if (atBottom) c.scrollTop = c.scrollHeight;
   } catch (e) {}
 };
@@ -862,35 +1035,55 @@ const pollActivity = async () => {
 };
 
 // actions
-$("btn-start").onclick = async () => { toast((await api("/api/start", "POST")).detail); pollStatus(); };
-$("btn-stop").onclick = async () => { toast((await api("/api/stop", "POST")).detail); pollStatus(); };
-$("btn-optimize").onclick = async () => {
-  $("btn-optimize").disabled = true;
-  toast("Running checks and fixes...");
+$("btn-start").onclick = () => runAction("btn-start", "Starting…", async () => {
+  const r = await api("/api/start", "POST");
+  if (r.ok === false) { toast(r.detail || "Start failed.", { error: true }); }
+  else toast(r.detail || "Starting cluster…");
+  pollStatus();
+}, { errorPrefix: "Start failed" });
+
+$("btn-stop").onclick = () => runAction("btn-stop", "Stopping…", async () => {
+  const r = await api("/api/stop", "POST");
+  if (r.ok === false) { toast(r.detail || "Stop failed.", { error: true }); }
+  else toast(r.detail || "Stopping cluster…");
+  pollStatus();
+}, { errorPrefix: "Stop failed" });
+
+$("btn-optimize").onclick = () => runAction("btn-optimize", "Optimizing…", async () => {
   const r = await api("/api/optimize", "POST");
-  const fixed = r.results.filter((x) => x.status === "fixed").length;
+  const fixed = (r.results || []).filter((x) => x.status === "fixed").length;
   toast(`Optimize done. ${fixed} item(s) fixed.`);
   pollActivity(); pollStatus();
-};
-$("btn-rdma").onclick = async () => {
-  toast("Checking NCCL transport...");
-  toast((await api("/api/rdma-check", "POST")).detail);
+}, { errorPrefix: "Optimize failed" });
+
+$("btn-rdma").onclick = () => runAction("btn-rdma", "Checking…", async () => {
+  const r = await api("/api/rdma-check", "POST");
+  if (r.ok === false) toast(r.detail || "RDMA check reported a problem.", { error: true });
+  else toast(r.detail || "RDMA transport checked.");
   pollActivity();
-};
-$("btn-save").onclick = async () => {
+}, { errorPrefix: "RDMA check failed" });
+
+$("btn-save").onclick = () => runAction("btn-save", "Saving…", async () => {
   const body = {
     MODEL: $("f-model").value.trim(),
     TENSOR_PARALLEL: $("f-tp").value,
     GPU_MEM_UTIL: $("f-util").value,
     MAX_MODEL_LEN: $("f-len").value,
   };
-  toast((await api("/api/config", "POST", body)).detail);
-};
-$("btn-reload").onclick = async () => {
+  const r = await api("/api/config", "POST", body);
+  if (r.ok === false) { toast(r.detail || "Save failed.", { error: true }); return false; }
+  toast(r.detail || "Config saved.");
+}, { errorPrefix: "Save failed", successLabel: "Saved ✓" });
+
+$("btn-reload").onclick = () => {
   const model = $("f-model").value.trim();
-  if (!model) return toast("Enter a model first.");
-  toast((await api("/api/model", "POST", { model })).detail);
-  pollActivity();
+  if (!model) { toast("Enter a model first.", { error: true }); return; }
+  runAction("btn-reload", "Reloading…", async () => {
+    const r = await api("/api/model", "POST", { model });
+    if (r.ok === false) toast(r.detail || "Reload failed.", { error: true });
+    else toast(r.detail || "Reload requested.");
+    pollActivity();
+  }, { errorPrefix: "Reload failed" });
 };
 $("btn-vllm-logs").onclick = async () => {
   if (consoleMode === "vllm") {
@@ -909,7 +1102,8 @@ $("btn-clear").onclick = () => { if (consoleMode === "activity") $("console").in
 const fitTag = (m) => {
   const map = { single: "single node", cluster: "needs both nodes", toobig: "too large", unknown: "size unknown" };
   const fp = m.footprint_gb ? ` ~${m.footprint_gb}GB` : "";
-  return `<span class="tag ${m.fit}">${map[m.fit] || m.fit}${fp}</span>`;
+  const fit = ["single", "cluster", "toobig", "unknown"].includes(m.fit) ? m.fit : "unknown";
+  return `<span class="tag ${fit}">${escapeHtml(map[fit] || fit)}${escapeHtml(fp)}</span>`;
 };
 
 const modelCard = (m, opts = {}) => {
@@ -918,12 +1112,13 @@ const modelCard = (m, opts = {}) => {
   if (m.gated) tags.push('<span class="tag gated">gated</span>');
   if (opts.downloads != null) tags.push(`<span class="tag">${fmtNum(m.downloads)} downloads</span>`);
   const canLoad = m.fit !== "toobig";
+  const modelId = escapeHtml(m.id);
   const loadBtn = m.active
     ? '<span class="tag single">active</span>'
-    : (canLoad ? `<button data-model="${m.id}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "");
-  const note = m.note ? `<div class="mnote">${m.note}</div>` : "";
+    : (canLoad ? `<button data-model="${modelId}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "");
+  const note = m.note ? `<div class="mnote">${escapeHtml(m.note)}</div>` : "";
   return `<div class="mcard ${m.active ? "active" : ""}">
-    <div class="mid">${m.id}</div>
+    <div class="mid">${modelId}</div>
     <div class="mmeta">${tags.join("")}</div>
     ${note}
     <div class="mact">${loadBtn}</div>
@@ -947,18 +1142,24 @@ const wireLoadButtons = (container) => {
         lines.push(`Engine: ${chk.engine === "llamacpp" ? "llama.cpp (single node)" : "vLLM (cluster)"}`);
         lines.push(chk.cached ? "Already cached, loads without downloading." : "Not cached, will download first.");
         if (chk.currently_serving) lines.push(`Replaces currently serving: ${chk.currently_serving}`);
-        chk.warnings.forEach((w) => lines.push("⚠ " + w));
-        const proceed = confirm(`Load ${model}?\n\n${lines.join("\n")}\n\n${chk.ok_to_load ? "Proceed?" : "This will likely fail. Try anyway?"}`);
+        (chk.warnings || []).forEach((w) => lines.push("⚠ " + w));
+        const proceed = await confirmModal({
+          title: `Load ${model}?`,
+          body: `${lines.join("\n")}\n\n${chk.ok_to_load ? "Proceed?" : "This will likely fail. Try anyway?"}`,
+          confirmLabel: chk.ok_to_load ? "Load" : "Try anyway",
+          danger: !chk.ok_to_load,
+        });
         if (!proceed) return;
       }
-      btn.disabled = true; btn.textContent = "Starting...";
+      btn.disabled = true; btn.textContent = "Starting…";
       const loadBody = { model };
       if (engineOverride !== "auto") loadBody.engine = engineOverride;
       try {
         const r = await api("/api/model", "POST", loadBody);
-        toast(r.detail);
+        if (r.ok === false) toast(r.detail || "Load failed.", { error: true });
+        else toast(r.detail || "Load requested.");
       } catch (e) {
-        toast("Load failed: " + e.message);
+        toastError("Load failed", e);
       }
       // always restore the button so it can be used again (e.g. after a later delete)
       btn.disabled = false; btn.textContent = original;
@@ -976,7 +1177,7 @@ const pageState = {};
 
 const renderPaged = (listId, items, cardFn, emptyMsg, opts = {}) => {
   const list = $(listId);
-  if (!items.length) { list.innerHTML = `<p class="hint">${emptyMsg}</p>`; return; }
+  if (!items.length) { list.innerHTML = `<p class="hint">${escapeHtml(emptyMsg)}</p>`; return; }
   if (pageState[listId] == null) pageState[listId] = 0;
   const pages = Math.ceil(items.length / PAGE_SIZE);
   if (pageState[listId] >= pages) pageState[listId] = pages - 1;
@@ -999,11 +1200,13 @@ const renderPaged = (listId, items, cardFn, emptyMsg, opts = {}) => {
 };
 
 const loadCurated = async () => {
-  const r = await api("/api/models/curated");
-  const b = r.budget;
+  let r;
+  try { r = await api("/api/models/curated"); }
+  catch (e) { $("budget-line").textContent = "Could not load model budget."; return; }
+  const b = r.budget || {};
   $("budget-line").textContent = `Pooled memory ~${b.pooled_gb}GB across both nodes, ~${b.usable_gb}GB usable. Single node holds ~${b.single_node_gb}GB. Estimates are approximate.`;
   pageState["curated-list"] = 0;
-  renderPaged("curated-list", r.models, (m) => modelCard(m), "No favorites configured.");
+  renderPaged("curated-list", r.models || [], (m) => modelCard(m), "No favorites configured.");
 };
 
 let librarySelected = null;
@@ -1013,7 +1216,9 @@ const saveFavorites = async () => {
 };
 
 const loadLibrary = async () => {
-  const r = await api("/api/library");
+  let r;
+  try { r = await api("/api/library"); }
+  catch (e) { $("library-list").innerHTML = `<p class="hint">${escapeHtml("Could not load library: " + (e.message || "unknown error"))}</p>`; return; }
   favorites = r.favorites || favorites;
   // storage bar
   const s = r.storage || {};
@@ -1040,24 +1245,26 @@ const loadLibrary = async () => {
     const fav = favorites.includes(m.id);
     const selected = librarySelected === m.id;
     const stateLabel = m.active ? " · active" : (m.configured ? " · configured (not serving)" : "");
-    return `<div class="libitem ${m.active ? "active" : ""} ${m.configured ? "configured" : ""} ${selected ? "selected" : ""}" data-model="${m.id}" data-engine="${eng}" tabindex="0" role="button" aria-pressed="${selected}">
+    const modelId = escapeHtml(m.id);
+    const size = escapeHtml(m.size_gb || "?");
+    return `<div class="libitem ${m.active ? "active" : ""} ${m.configured ? "configured" : ""} ${selected ? "selected" : ""}" data-model="${modelId}" data-engine="${eng}" tabindex="0" role="button" aria-pressed="${selected}">
       <div class="li-left">
         <div class="li-name">
-          <button class="li-star ${fav ? "on" : ""}" data-model="${m.id}" aria-label="${fav ? "Unfavorite" : "Favorite"}" title="${fav ? "Remove from favorites" : "Add to favorites"}">${fav ? "★" : "☆"}</button>
-          ${m.id}
+          <button class="li-star ${fav ? "on" : ""}" data-model="${modelId}" aria-label="${fav ? "Unfavorite" : "Favorite"}" title="${fav ? "Remove from favorites" : "Add to favorites"}">${fav ? "★" : "☆"}</button>
+          ${modelId}
         </div>
-        <div class="li-meta"><span class="li-badge ${eng}">${engLabel}</span>${m.is_draft ? '<span class="li-badge draft">DFlash draft</span>' : (m.dflash ? '<span class="li-badge dflash">DFlash</span>' : "")}${m.size_gb || "?"}GB on disk${stateLabel}</div>
+        <div class="li-meta"><span class="li-badge ${eng}">${engLabel}</span>${m.is_draft ? '<span class="li-badge draft">DFlash draft</span>' : (m.dflash ? '<span class="li-badge dflash">DFlash</span>' : "")}${size}GB on disk${stateLabel}</div>
       </div>
       <div class="li-act">
         ${m.active
-          ? `<button class="lib-reload" data-model="${m.id}" data-engine="${eng}">Reload</button>
-             <button class="lib-unload danger" data-model="${m.id}">Unload</button>
-             <button class="lib-del danger" data-model="${m.id}">Delete</button>`
+          ? `<button class="lib-reload" data-model="${modelId}" data-engine="${eng}">Reload</button>
+             <button class="lib-unload danger" data-model="${modelId}">Unload</button>
+             <button class="lib-del danger" data-model="${modelId}">Delete</button>`
           : m.is_draft
             ? `<span class="li-draftnote">auto-loaded with its base</span>
-               <button class="lib-del danger" data-model="${m.id}">Delete</button>`
-            : `<button class="lib-load" data-model="${m.id}" data-engine="${eng}">${m.dflash ? "Load (DFlash)" : "Load"}</button>
-               <button class="lib-del danger" data-model="${m.id}">Delete</button>`}
+               <button class="lib-del danger" data-model="${modelId}">Delete</button>`
+            : `<button class="lib-load" data-model="${modelId}" data-engine="${eng}">${m.dflash ? "Load (DFlash)" : "Load"}</button>
+               <button class="lib-del danger" data-model="${modelId}">Delete</button>`}
       </div>
     </div>`;
   }).join("");
@@ -1087,13 +1294,15 @@ const loadLibrary = async () => {
   });
 
   const doLoad = async (model, btn, label) => {
+    if (btn.disabled) return;
     btn.disabled = true; const orig = btn.textContent; btn.textContent = label;
     const loadBody = { model };
     if (engineOverride !== "auto") loadBody.engine = engineOverride;
     try {
       const r = await api("/api/model", "POST", loadBody);
-      toast(r.detail || "Load requested");
-    } catch (e) { toast("Load failed: " + e.message); }
+      if (r.ok === false) toast(r.detail || "Load failed.", { error: true });
+      else toast(r.detail || "Load requested");
+    } catch (e) { toastError("Load failed", e); }
     btn.disabled = false; btn.textContent = orig;
     pollDownload(); pollActivity();
     setTimeout(() => { loadLibrary(); updateNowServing(); pollEngines(); }, 1500);
@@ -1108,12 +1317,19 @@ const loadLibrary = async () => {
   // unload (active model) - clears selection and active highlight on refresh
   list.querySelectorAll(".lib-unload").forEach((b) => {
     b.onclick = async () => {
-      if (!confirm("Unload the active model? This frees memory and leaves the cluster idle.")) return;
-      b.disabled = true; b.textContent = "Unloading...";
+      const ok = await confirmModal({
+        title: "Unload model",
+        body: "Unload the active model? This frees memory and leaves the cluster idle.",
+        confirmLabel: "Unload",
+        danger: true,
+      });
+      if (!ok) return;
+      b.disabled = true; b.textContent = "Unloading…";
       try {
         const r = await api("/api/model/unload", "POST");
-        toast(r.detail);
-      } catch (e) { toast("Unload failed: " + e.message); b.disabled = false; b.textContent = "Unload"; return; }
+        if (r.ok === false) { toast(r.detail || "Unload failed.", { error: true }); b.disabled = false; b.textContent = "Unload"; return; }
+        toast(r.detail || "Unloading…");
+      } catch (e) { toastError("Unload failed", e); b.disabled = false; b.textContent = "Unload"; return; }
       librarySelected = null;
       // poll until the engine actually reports idle, so the row doesn't loop back to Unload
       let tries = 0;
@@ -1134,12 +1350,19 @@ const loadLibrary = async () => {
   list.querySelectorAll(".lib-del").forEach((b) => {
     b.onclick = async () => {
       const model = b.getAttribute("data-model");
-      if (!confirm(`Delete ${model} from disk? This frees the space but you'd re-download to use it again.`)) return;
-      b.disabled = true; b.textContent = "Deleting...";
+      const ok = await confirmModal({
+        title: "Delete model",
+        body: `Delete ${model} from disk? This frees the space but you'd re-download to use it again.`,
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
+      b.disabled = true; b.textContent = "Deleting…";
       try {
         const r = await api("/api/library/delete", "POST", { model });
-        toast(r.detail);
-      } catch (e) { toast("Delete failed: " + e.message); }
+        if (r.ok === false) toast(r.detail || "Delete failed.", { error: true });
+        else toast(r.detail || "Deleted.");
+      } catch (e) { toastError("Delete failed", e); }
       if (librarySelected === model) librarySelected = null;
       loadLibrary();
     };
@@ -1166,27 +1389,33 @@ const loadLibrary = async () => {
 
 $("sb-path-save").onclick = async () => {
   const path = $("sb-path-input").value.trim();
-  if (!path) { toast("Enter a cache path."); return; }
-  if (!confirm(`Set cache path to ${path}? Applies on next cluster start. Existing models stay where they are.`)) return;
-  const r = await api("/api/storage/path", "POST", { path });
-  toast(r.detail);
+  if (!path) { toast("Enter a cache path.", { error: true }); return; }
+  const ok = await confirmModal({
+    title: "Set cache path",
+    body: `Set cache path to ${path}? Applies on next cluster start. Existing models stay where they are.`,
+    confirmLabel: "Set path",
+  });
+  if (!ok) return;
+  runAction("sb-path-save", "Saving…", async () => {
+    const r = await api("/api/storage/path", "POST", { path });
+    if (r.ok === false) toast(r.detail || "Could not set cache path.", { error: true });
+    else toast(r.detail || "Cache path set.");
+  }, { errorPrefix: "Set path failed" });
 };
 
-$("lib-selbar-load").onclick = async () => {
+$("lib-selbar-load").onclick = () => {
   if (!librarySelected) return;
   const model = librarySelected;
-  const btn = $("lib-selbar-load");
-  btn.disabled = true; btn.textContent = "Loading...";
-  const loadBody = { model };
-  if (engineOverride !== "auto") loadBody.engine = engineOverride;
-  try {
+  runAction("lib-selbar-load", "Loading…", async () => {
+    const loadBody = { model };
+    if (engineOverride !== "auto") loadBody.engine = engineOverride;
     const r = await api("/api/model", "POST", loadBody);
-    toast(r.detail || "Load requested");
-  } catch (e) { toast("Load failed: " + e.message); }
-  btn.disabled = false; btn.textContent = "Load selected";
-  librarySelected = null;
-  pollDownload(); pollActivity();
-  setTimeout(() => { loadLibrary(); updateNowServing(); pollEngines(); }, 1500);
+    if (r.ok === false) toast(r.detail || "Load failed.", { error: true });
+    else toast(r.detail || "Load requested");
+    librarySelected = null;
+    pollDownload(); pollActivity();
+    setTimeout(() => { loadLibrary(); updateNowServing(); pollEngines(); }, 1500);
+  }, { errorPrefix: "Load failed" });
 };
 
 $("lib-selbar-clear").onclick = () => { librarySelected = null; loadLibrary(); };
@@ -1195,9 +1424,14 @@ const runSearch = async () => {
   const q = $("search-input").value.trim();
   if (!q) return;
   $("search-list").innerHTML = '<p class="hint">Searching Hugging Face...</p>';
-  const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
-  pageState["search-list"] = 0;
-  renderPaged("search-list", r.results, (m) => modelCard(m, { downloads: m.downloads }), "No results. Try different terms.");
+  try {
+    const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
+    pageState["search-list"] = 0;
+    renderPaged("search-list", r.results || [], (m) => modelCard(m, { downloads: m.downloads }), "No results. Try different terms.");
+  } catch (e) {
+    $("search-list").innerHTML = `<p class="hint">${escapeHtml("Search failed: " + (e.message || "unknown error"))}</p>`;
+    toastError("Search failed", e);
+  }
 };
 $("search-btn").onclick = runSearch;
 $("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
@@ -1374,37 +1608,45 @@ const loadNas = async () => {
   }
   $("nas-list").innerHTML = models.map((m) => {
     const kindLabel = m.kind === "gguf" ? "GGUF" : "safetensors";
+    const modelId = escapeHtml(m.id);
+    const size = escapeHtml(m.size_gb || "?");
     return `<div class="libitem">
       <div class="li-left">
-        <div class="li-name">${m.id}</div>
-        <div class="li-meta"><span class="li-badge ${m.kind === "gguf" ? "llamacpp" : "vllm"}">${kindLabel}</span>${m.size_gb || "?"}GB on NAS${m.local ? " · already local" : ""}</div>
+        <div class="li-name">${modelId}</div>
+        <div class="li-meta"><span class="li-badge ${m.kind === "gguf" ? "llamacpp" : "vllm"}">${kindLabel}</span>${size}GB on NAS${m.local ? " · already local" : ""}</div>
       </div>
       <div class="li-act">
         ${m.local
           ? `<span class="nas-haveit">On cluster</span>`
-          : `<button class="nas-bring" data-model="${m.id}">Bring to cluster</button>`}
+          : `<button class="nas-bring" data-model="${modelId}">Bring to cluster</button>`}
       </div>
     </div>`;
   }).join("");
   $("nas-list").querySelectorAll(".nas-bring").forEach((b) => {
     b.onclick = async () => {
+      if (b.disabled) return;
       const model = b.getAttribute("data-model");
-      b.disabled = true; b.textContent = "Copying...";
+      b.disabled = true; const orig = b.textContent; b.textContent = "Copying…";
       try {
         const r2 = await api("/api/nas/bring", "POST", { model });
-        toast(r2.detail);
-      } catch (e) { toast("Copy failed: " + e.message); }
+        if (r2.ok === false) toast(r2.detail || "Copy failed.", { error: true });
+        else toast(r2.detail || "Copying to cluster…");
+      } catch (e) { toastError("Copy failed", e); }
+      b.disabled = false; b.textContent = orig;
       pollDownload();
       setTimeout(() => { loadNas(); }, 2000);
     };
   });
 };
 
-$("nas-path-save").onclick = async () => {
+$("nas-path-save").onclick = () => {
   const path = $("nas-path-input").value.trim();
-  const r = await api("/api/nas/path", "POST", { path });
-  toast(r.detail);
-  loadNas();
+  runAction("nas-path-save", "Saving…", async () => {
+    const r = await api("/api/nas/path", "POST", { path });
+    if (r.ok === false) toast(r.detail || "Could not set NAS path.", { error: true });
+    else toast(r.detail || "NAS path set.");
+    loadNas();
+  }, { errorPrefix: "Set NAS path failed" });
 };
 
 loadCurated();
@@ -1451,15 +1693,17 @@ const drawChart = (svgId, samples, headKey, workerKey, opts = {}) => {
 };
 
 const loadCost = async () => {
-  const c = await api("/api/cost");
-  const card = (label, d) => `<div class="costcard"><div class="cc-label">${label}</div><div class="cc-val">$${d.cost_equiv.toFixed(2)}</div><div class="cc-sub">${fmtNum(d.tokens)} tokens</div></div>`;
+  let c;
+  try { c = await api("/api/cost"); } catch (e) { return; }
+  const card = (label, d) => `<div class="costcard"><div class="cc-label">${escapeHtml(label)}</div><div class="cc-val">$${escapeHtml(d.cost_equiv.toFixed(2))}</div><div class="cc-sub">${fmtNum(d.tokens)} tokens</div></div>`;
   $("cost-cards").innerHTML = card("Today", c.today) + card("This week", c.week) + card("All time", c.all)
-    + `<div class="costcard"><div class="cc-label">Rate</div><div class="cc-val" style="color:var(--muted)">$${c.rate_per_mtok}</div><div class="cc-sub">per 1M tokens</div></div>`;
+    + `<div class="costcard"><div class="cc-label">Rate</div><div class="cc-val" style="color:var(--muted)">$${escapeHtml(c.rate_per_mtok)}</div><div class="cc-sub">per 1M tokens</div></div>`;
 };
 
 const loadHistory = async () => {
-  const r = await api(`/api/history?window=${histWindow}`);
-  const s = r.samples;
+  let r;
+  try { r = await api(`/api/history?window=${histWindow}`); } catch (e) { return; }
+  const s = r.samples || [];
   drawChart("chart-tps", s, "tps", null, { zeroBase: true });
   drawChart("chart-temp", s, "head_temp", "worker_temp");
   drawChart("chart-power", s, "head_power", "worker_power", { zeroBase: true });
@@ -1487,7 +1731,7 @@ const loadImageOverview = async () => {
   let o;
   try { o = await api("/api/image/overview"); } catch (e) { return; }
   const cur = o.current || {};
-  $("img-current").innerHTML = `Running vLLM <b>${cur.vllm_version || "unknown"}</b> · image <b>${cur.image || "?"}</b>`;
+  $("img-current").innerHTML = `Running vLLM <b>${escapeHtml(cur.vllm_version || "unknown")}</b> · image <b>${escapeHtml(cur.image || "?")}</b>`;
 
   // available newer NGC tags
   const cands = (o.candidates || []).filter((c) => c.available);
@@ -1495,8 +1739,8 @@ const loadImageOverview = async () => {
   if (cands.length) {
     cdiv.innerHTML = cands.map((c) => `
       <div class="imgrow">
-        <div><div class="ir-tag ir-new">${c.tag}</div><div class="ir-meta">available on NGC, newer than current</div></div>
-        <div class="ir-act"><button class="img-update" data-tag="${c.tag}">Pull &amp; build</button></div>
+        <div><div class="ir-tag ir-new">${escapeHtml(c.tag)}</div><div class="ir-meta">available on NGC, newer than current</div></div>
+        <div class="ir-act"><button class="img-update" data-tag="${escapeHtml(c.tag)}">Pull &amp; build</button></div>
       </div>`).join("");
   } else {
     cdiv.innerHTML = '<p class="hint">No newer NGC tags detected right now. You are likely on the latest.</p>';
@@ -1504,9 +1748,18 @@ const loadImageOverview = async () => {
   cdiv.querySelectorAll(".img-update").forEach((b) => {
     b.onclick = async () => {
       const tag = b.getAttribute("data-tag");
-      if (!confirm(`Pull and build ${tag}? This downloads ~19GB on each node and rebuilds the Ray layer. Your current image is kept for rollback.`)) return;
+      const ok = await confirmModal({
+        title: `Pull & build ${tag}?`,
+        body: `This downloads ~19GB on each node and rebuilds the Ray layer. Your current image is kept for rollback.`,
+        confirmLabel: "Pull & build",
+      });
+      if (!ok) return;
       b.disabled = true;
-      toast((await api("/api/image/update", "POST", { tag })).detail);
+      try {
+        const r = await api("/api/image/update", "POST", { tag });
+        if (r.ok === false) { toast(r.detail || "Update failed.", { error: true }); b.disabled = false; }
+        else toast(r.detail || "Pulling image…");
+      } catch (e) { toastError("Update failed", e); b.disabled = false; }
       pollImage();
     };
   });
@@ -1517,15 +1770,26 @@ const loadImageOverview = async () => {
   if (locals.length) {
     ldiv.innerHTML = `<p class="hint" style="margin-top:12px">Built images (switch or roll back):</p>` + locals.map((l) => `
       <div class="imgrow">
-        <div><div class="ir-tag ir-have">gx10/vllm-ray:${l.tag}</div><div class="ir-meta">${l.size} · ${l.created}</div></div>
-        <div class="ir-act"><button class="img-switch" data-tag="${l.tag}">Use this</button></div>
+        <div><div class="ir-tag ir-have">gx10/vllm-ray:${escapeHtml(l.tag)}</div><div class="ir-meta">${escapeHtml(l.size)} · ${escapeHtml(l.created)}</div></div>
+        <div class="ir-act"><button class="img-switch" data-tag="${escapeHtml(l.tag)}">Use this</button></div>
       </div>`).join("");
     ldiv.querySelectorAll(".img-switch").forEach((b) => {
       b.onclick = async () => {
         const tag = b.getAttribute("data-tag");
-        if (!confirm(`Switch the cluster to gx10/vllm-ray:${tag}? The cluster will need a relaunch (Stop then Start).`)) return;
-        const r = await api("/api/image/switch", "POST", { tag });
-        toast(r.detail);
+        const ok = await confirmModal({
+          title: "Switch image",
+          body: `Switch the cluster to gx10/vllm-ray:${tag}? The cluster will need a relaunch (Stop then Start).`,
+          confirmLabel: "Switch",
+        });
+        if (!ok) return;
+        if (b.disabled) return;
+        b.disabled = true; const orig = b.textContent; b.textContent = "Switching…";
+        try {
+          const r = await api("/api/image/switch", "POST", { tag });
+          if (r.ok === false) toast(r.detail || "Switch failed.", { error: true });
+          else toast(r.detail || "Image switched.");
+        } catch (e) { toastError("Switch failed", e); }
+        b.disabled = false; b.textContent = orig;
       };
     });
   } else {
@@ -1586,32 +1850,39 @@ const pollEngines = async () => {
 $("ll-load").onclick = async () => {
   const repo = $("ll-repo").value.trim();
   const gguf = $("ll-file").value.trim();
-  if (!repo || !gguf) { toast("Enter both a GGUF repo and file name."); return; }
-  if (!confirm(`Load ${gguf} on llama.cpp (single node)?\n\nThis downloads the GGUF if needed and serves it on port ${"8001"}. If vLLM is using the box, memory may be tight.`)) return;
-  $("ll-load").disabled = true;
-  const r = await api("/api/llama/start", "POST", { repo, gguf_file: gguf });
-  toast(r.detail);
-  $("ll-load").disabled = false;
-  pollEngines(); pollActivity();
+  if (!repo || !gguf) { toast("Enter both a GGUF repo and file name.", { error: true }); return; }
+  const ok = await confirmModal({
+    title: `Load ${gguf} on llama.cpp?`,
+    body: `Single node. This downloads the GGUF if needed and serves it on port 8001. If vLLM is using the box, memory may be tight.`,
+    confirmLabel: "Load",
+  });
+  if (!ok) return;
+  runAction("ll-load", "Loading…", async () => {
+    const r = await api("/api/llama/start", "POST", { repo, gguf_file: gguf });
+    if (r.ok === false) toast(r.detail || "Load failed.", { error: true });
+    else toast(r.detail || "Loading on llama.cpp…");
+    pollEngines(); pollActivity();
+  }, { errorPrefix: "Load failed" });
 };
 
 $("engine-stop").onclick = async () => {
   const engine = $("engine-stop").getAttribute("data-engine");
   const label = engine === "vllm" ? "vLLM" : "llama.cpp";
-  if (!confirm(`Stop ${label}? This unloads the model it's serving.`)) return;
-  $("engine-stop").disabled = true;
-  try {
-    if (engine === "vllm") {
-      await api("/api/model/unload", "POST");
-    } else {
-      await api("/api/llama/stop", "POST");
-    }
-    toast(`Stopping ${label}...`);
-  } catch (e) {
-    toast("Stop failed: " + e.message);
-  }
-  $("engine-stop").disabled = false;
-  setTimeout(() => { pollEngines(); updateNowServing(); }, 1200);
+  const ok = await confirmModal({
+    title: `Stop ${label}`,
+    body: `Stop ${label}? This unloads the model it's serving.`,
+    confirmLabel: "Stop",
+    danger: true,
+  });
+  if (!ok) return;
+  runAction("engine-stop", "Stopping…", async () => {
+    let r;
+    if (engine === "vllm") r = await api("/api/model/unload", "POST");
+    else r = await api("/api/llama/stop", "POST");
+    if (r && r.ok === false) toast(r.detail || `Stop ${label} failed.`, { error: true });
+    else toast(`Stopping ${label}…`);
+    setTimeout(() => { pollEngines(); updateNowServing(); }, 1200);
+  }, { errorPrefix: "Stop failed" });
 };
 
 pollEngines();
@@ -1805,11 +2076,11 @@ const benchIdle = () => { $("bench-run").disabled = false; $("bench-run").textCo
 const renderBenchResult = (r) => {
   if (!r) return "";
   return `<div class="bench-result">
-    <div class="br"><div class="br-v">${r.tps != null ? r.tps : "--"}</div><div class="br-k">tok/s aggregate</div></div>
-    <div class="br"><div class="br-v">${r.ttft_ms != null ? r.ttft_ms : "--"}</div><div class="br-k">avg TTFT ms</div></div>
-    <div class="br"><div class="br-v">${r.requests != null ? r.requests : "--"}</div><div class="br-k">requests</div></div>
+    <div class="br"><div class="br-v">${escapeHtml(r.tps != null ? r.tps : "--")}</div><div class="br-k">tok/s aggregate</div></div>
+    <div class="br"><div class="br-v">${escapeHtml(r.ttft_ms != null ? r.ttft_ms : "--")}</div><div class="br-k">avg TTFT ms</div></div>
+    <div class="br"><div class="br-v">${escapeHtml(r.requests != null ? r.requests : "--")}</div><div class="br-k">requests</div></div>
     <div class="br"><div class="br-v">${fmtNum(r.total_tokens)}</div><div class="br-k">tokens</div></div>
-    <div class="br"><div class="br-v">${r.duration_s != null ? r.duration_s + "s" : "--"}</div><div class="br-k">duration</div></div>
+    <div class="br"><div class="br-v">${escapeHtml(r.duration_s != null ? r.duration_s + "s" : "--")}</div><div class="br-k">duration</div></div>
   </div>`;
 };
 const pollBenchStatus = async () => {
@@ -1818,14 +2089,14 @@ const pollBenchStatus = async () => {
   const el = $("bench-status");
   if (b.status === "running" || b.status === "starting") {
     el.classList.remove("hidden");
-    el.innerHTML = `<span class="spin"></span>${b.detail || "Running benchmark..."}`;
+    el.innerHTML = `<span class="spin"></span>${escapeHtml(b.detail || "Running benchmark...")}`;
   } else if (b.status === "done") {
     el.classList.remove("hidden");
-    el.innerHTML = `<div>Done — ${b.detail || ""}</div>` + renderBenchResult(b.result);
+    el.innerHTML = `<div>Done — ${escapeHtml(b.detail || "")}</div>` + renderBenchResult(b.result);
     stopBenchPoll(); benchIdle(); loadBenchHistory();
   } else if (b.status === "error") {
     el.classList.remove("hidden");
-    el.innerHTML = `<div style="color:var(--err)">${(b.error || "Benchmark failed.").replace(/</g, "&lt;")}</div>`;
+    el.innerHTML = `<div style="color:var(--err)">${escapeHtml(b.error || "Benchmark failed.")}</div>`;
     stopBenchPoll(); benchIdle();
   }
 };
@@ -1837,25 +2108,25 @@ const loadBenchHistory = async () => {
   const when = (ts) => new Date(ts * 1000).toLocaleString();
   $("bench-hist").innerHTML = `<table class="bench-table">
     <thead><tr><th>When</th><th>Model</th><th>Conc</th><th>tok/s</th><th>TTFT ms</th><th>Tokens</th><th>Dur s</th></tr></thead>
-    <tbody>${rows.map((b) => `<tr><td>${when(b.ts)}</td><td>${(b.model || "").replace(/</g, "&lt;")}</td><td>${b.concurrency}</td><td>${b.tps != null ? b.tps : "--"}</td><td>${b.ttft_ms != null ? b.ttft_ms : "--"}</td><td>${fmtNum(b.total_tokens)}</td><td>${b.duration_s != null ? b.duration_s : "--"}</td></tr>`).join("")}</tbody>
+    <tbody>${rows.map((b) => `<tr><td>${escapeHtml(when(b.ts))}</td><td>${escapeHtml(b.model || "")}</td><td>${escapeHtml(b.concurrency)}</td><td>${escapeHtml(b.tps != null ? b.tps : "--")}</td><td>${escapeHtml(b.ttft_ms != null ? b.ttft_ms : "--")}</td><td>${fmtNum(b.total_tokens)}</td><td>${escapeHtml(b.duration_s != null ? b.duration_s : "--")}</td></tr>`).join("")}</tbody>
   </table>`;
 };
 $("bench-run").onclick = async () => {
   const concurrency = Math.max(1, Math.min(64, parseInt($("bench-conc").value, 10) || 4));
   const max_tokens = Math.max(1, Math.min(2048, parseInt($("bench-maxtok").value, 10) || 128));
   const prompt = $("bench-prompt").value.trim();
-  $("bench-run").disabled = true; $("bench-run").textContent = "Running...";
+  $("bench-run").disabled = true; $("bench-run").textContent = "Running…";
   let r;
   try { r = await api("/api/benchmark", "POST", { concurrency, max_tokens, prompt }); }
-  catch (e) { toast("Benchmark failed: " + e.message); benchIdle(); return; }
-  if (!r.ok) {
-    toast(r.detail);
+  catch (e) { toastError("Benchmark failed", e); benchIdle(); return; }
+  if (r.ok === false) {
+    toast(r.detail || "Benchmark failed.", { error: true });
     if (r.detail && r.detail.includes("already running")) { startBenchPoll(); }
     else { benchIdle(); }
     return;
   }
   $("bench-status").classList.remove("hidden");
-  $("bench-status").innerHTML = `<span class="spin"></span>${r.detail}`;
+  $("bench-status").innerHTML = `<span class="spin"></span>${escapeHtml(r.detail)}`;
   startBenchPoll();
 };
 
@@ -1902,29 +2173,46 @@ const pollDownload = async () => {
 };
 
 $("dl-dismiss").onclick = async () => {
-  await api("/api/download/dismiss", "POST");
+  try { await api("/api/download/dismiss", "POST"); }
+  catch (e) { toastError("Dismiss failed", e); }
   $("dl-banner").classList.add("hidden");
 };
 
 $("dl-cancel").onclick = async () => {
-  if (!confirm("Cancel this load? It stops the in-progress load/compile and returns the cluster to idle.")) return;
-  $("dl-cancel").disabled = true; $("dl-cancel").textContent = "Cancelling...";
+  const ok = await confirmModal({
+    title: "Cancel load",
+    body: "Cancel this load? It stops the in-progress load/compile and returns the cluster to idle.",
+    confirmLabel: "Cancel load",
+    cancelLabel: "Keep going",
+    danger: true,
+  });
+  if (!ok) return;
+  $("dl-cancel").disabled = true; $("dl-cancel").textContent = "Cancelling…";
   try {
     const r = await api("/api/model/cancel", "POST");
-    toast(r.detail);
+    if (r.ok === false) toast(r.detail || "Cancel failed.", { error: true });
+    else toast(r.detail || "Cancelling…");
   } catch (e) {
-    toast("Cancel failed: " + e.message);
+    toastError("Cancel failed", e);
   }
   $("dl-cancel").disabled = false; $("dl-cancel").textContent = "Cancel";
   setTimeout(() => { pollDownload(); updateNowServing(); pollEngines(); if (typeof loadLibrary === "function") loadLibrary(); }, 1200);
 };
 
 $("btn-unload").onclick = async () => {
-  $("btn-unload").disabled = true;
-  const r = await api("/api/model/unload", "POST");
-  toast(r.detail);
-  $("btn-unload").disabled = false;
-  pollStatus(); pollDownload();
+  const ok = await confirmModal({
+    title: "Unload model",
+    body: "Unload the active model? This frees memory and leaves the cluster idle.",
+    confirmLabel: "Unload",
+    danger: true,
+  });
+  if (!ok) return;
+  runAction("btn-unload", "Unloading…", async () => {
+    const r = await api("/api/model/unload", "POST");
+    if (r.ok === false) toast(r.detail || "Unload failed.", { error: true });
+    else toast(r.detail || "Unloading…");
+    pollStatus(); pollDownload();
+  }, { errorPrefix: "Unload failed" });
 };
 
 tick(); pollStatus(); pollActivity(); pollMetrics(); pollDownload();

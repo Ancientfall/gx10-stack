@@ -39,6 +39,10 @@ UNIFIED_MEM="${LLAMA_UNIFIED_MEMORY:-0}"
 
 log() { printf '\033[0;32m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+valid_repo() { [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; }
+valid_gguf() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+=@-]*\.[Gg][Gg][Uu][Ff]$ ]]; }
+valid_uint() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge "$2" && "$1" -le "$3" ]]; }
+valid_image_ref() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9][A-Za-z0-9._-]*)?$ ]]; }
 
 cmd="${1:-}"
 
@@ -61,6 +65,11 @@ REPO="${1:-}"
 GGUF_FILE="${2:-}"
 CTX="${3:-${DEFAULT_CTX}}"
 [[ -n "${GGUF_FILE}" ]] || fail "Usage: ./llama-serve.sh <gguf-repo> <gguf-file> [ctx]  (repo optional if file is already local)"
+[[ -z "${REPO}" ]] || valid_repo "${REPO}" || fail "Invalid Hugging Face repo id: ${REPO}"
+valid_gguf "${GGUF_FILE}" || fail "Invalid GGUF filename: ${GGUF_FILE}"
+valid_uint "${CTX}" 512 1048576 || fail "Invalid ctx: ${CTX}"
+valid_uint "${LLAMA_PORT}" 1 65535 || fail "Invalid LLAMA_PORT: ${LLAMA_PORT}"
+valid_image_ref "${LLAMA_IMAGE}" || fail "Invalid LLAMA_IMAGE: ${LLAMA_IMAGE}"
 
 mkdir -p "${GGUF_DIR}"
 
@@ -75,8 +84,9 @@ if [[ ! -f "${GGUF_DIR}/${GGUF_FILE}" ]]; then
     else
         docker run --rm -v "${GGUF_DIR}:/out" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
-            python:3.12-slim bash -c \
-            "pip install -q huggingface_hub && hf download '${REPO}' '${GGUF_FILE}' --local-dir /out ${HF_TOKEN:+--token \$HF_TOKEN}"
+            python:3.12-slim bash -lc \
+            'pip install -q huggingface_hub && hf download "$1" "$2" --local-dir /out ${HF_TOKEN:+--token "$HF_TOKEN"}' \
+            hf-download "${REPO}" "${GGUF_FILE}"
     fi
 else
     log "GGUF already local: ${GGUF_FILE} (serving directly, no download)"

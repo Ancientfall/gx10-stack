@@ -21,9 +21,11 @@ import subprocess
 import collections
 from pathlib import Path
 
-from fastapi import FastAPI, Body
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+import httpx
+from fastapi import FastAPI, Body, Request
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 # ------------------------------------------------------------
 # Paths and configuration
@@ -74,6 +76,98 @@ CONFIG_FIELDS = {
     "GPU_MEM_UTIL": float,
 }
 
+HF_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+GGUF_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+=@-]*\.gguf$", re.IGNORECASE)
+IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SHELL_META_RE = re.compile(r"""[\s'"\\`$;&|<>*?()[\]{}!]""")
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def _validate_hf_repo_id(value: str, field: str = "model") -> str:
+    value = str(value or "").strip()
+    if not HF_REPO_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a Hugging Face repo id like org/name")
+    return value
+
+
+def _validate_gguf_filename(value: str, field: str = "GGUF file") -> str:
+    value = str(value or "").strip()
+    if not GGUF_FILE_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a simple .gguf filename")
+    return value
+
+
+def _validate_image_tag(value: str, field: str = "image tag") -> str:
+    value = str(value or "").strip()
+    if not IMAGE_TAG_RE.fullmatch(value):
+        raise ValueError(f"{field} contains invalid characters")
+    return value
+
+
+def _validate_image_ref(value: str, field: str = "image") -> str:
+    value = str(value or "").strip()
+    if not IMAGE_REF_RE.fullmatch(value):
+        raise ValueError(f"{field} contains invalid characters")
+    return value
+
+
+def _validate_abs_path(value: str, field: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if not value.startswith("/"):
+        raise ValueError(f"{field} must be an absolute path")
+    if SHELL_META_RE.search(value) or _has_control_chars(value):
+        raise ValueError(f"{field} contains unsafe shell characters")
+    return value
+
+
+def _validate_int_range(value, field: str, min_value: int, max_value: int) -> str:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be an integer")
+    if n < min_value or n > max_value:
+        raise ValueError(f"{field} must be between {min_value} and {max_value}")
+    return str(n)
+
+
+def _validate_float_range(value, field: str, min_value: float, max_value: float) -> str:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a number")
+    if n < min_value or n > max_value:
+        raise ValueError(f"{field} must be between {min_value} and {max_value}")
+    return str(n)
+
+
+def _validate_env_value(key: str, value: str) -> str:
+    value = str(value)
+    if "\n" in value or "\r" in value or _has_control_chars(value):
+        raise ValueError(f"{key} contains control characters")
+    if key == "MODEL":
+        return "" if not value else _validate_hf_repo_id(value, "MODEL")
+    if key in ("HF_CACHE_DIR", "NAS_PATH"):
+        return _validate_abs_path(value, key)
+    if key == "VLLM_IMAGE":
+        return _validate_image_ref(value, key)
+    if key in ("API_PORT", "RAY_DASHBOARD_PORT", "LLAMA_PORT", "RAY_PORT"):
+        return _validate_int_range(value, key, 1, 65535)
+    if key == "TENSOR_PARALLEL":
+        return _validate_int_range(value, key, 1, 8)
+    if key == "MAX_MODEL_LEN":
+        return _validate_int_range(value, key, 512, 1048576)
+    if key == "GPU_MEM_UTIL":
+        return _validate_float_range(value, key, 0.1, 0.95)
+    if SHELL_META_RE.search(value):
+        raise ValueError(f"{key} contains unsafe shell characters")
+    return value
+
 # ------------------------------------------------------------
 # Small key/value .env reader and writer (keeps quotes/format sane)
 # ------------------------------------------------------------
@@ -99,6 +193,7 @@ def write_env_value(path: Path, key: str, value: str) -> None:
     """Update a single KEY="value" line in place, preserving the rest of the file.
     Serialized + atomic (temp file then os.replace) so concurrent writers from
     different threads can't lose updates or leave a half-written file."""
+    value = _validate_env_value(key, value)
     with _env_lock:
         lines = path.read_text().splitlines() if path.exists() else []
         pattern = re.compile(rf'^\s*{re.escape(key)}\s*=')
@@ -1113,7 +1208,14 @@ def start_cluster():
     if not _action_lock.acquire(blocking=False):
         return {"ok": False, "detail": f"Busy: {_current_action['name'] or 'a cluster action'}"}
     _current_action["name"] = "starting"
-    threading.Thread(target=_run_launch, daemon=True).start()
+    # If the worker thread fails to start, _run_launch never runs its finally, so
+    # release the lock here or Start/Stop stays wedged until a process restart.
+    try:
+        threading.Thread(target=_run_launch, daemon=True).start()
+    except Exception as e:
+        _current_action["name"] = None
+        _action_lock.release()
+        return {"ok": False, "detail": f"Could not start launch thread: {e}"}
     return {"ok": True, "detail": "Start initiated. Watch the activity log."}
 
 
@@ -1121,7 +1223,13 @@ def stop_cluster():
     if not _action_lock.acquire(blocking=False):
         return {"ok": False, "detail": f"Busy: {_current_action['name'] or 'a cluster action'}"}
     _current_action["name"] = "stopping"
-    threading.Thread(target=_run_launch, args=("stop",), daemon=True).start()
+    clear_serving_state()
+    try:
+        threading.Thread(target=_run_launch, args=("stop",), daemon=True).start()
+    except Exception as e:
+        _current_action["name"] = None
+        _action_lock.release()
+        return {"ok": False, "detail": f"Could not start stop thread: {e}"}
     return {"ok": True, "detail": "Stop initiated."}
 
 
@@ -1160,8 +1268,11 @@ def _claim_job(model=None, status="starting", detail="") -> tuple:
 
 
 def _job_is_current(jid) -> bool:
-    """True if this worker still owns the job slot (not cancelled/superseded)."""
-    return jid == _job_id
+    """True if this worker still owns the job slot (not cancelled/superseded).
+    Reads _job_id under the lock so a worker can't observe a torn view between
+    _claim_job/cancel bumping the id and updating the slot state."""
+    with _download_lock:
+        return jid == _job_id
 
 
 def _release_job(jid) -> None:
@@ -1169,6 +1280,19 @@ def _release_job(jid) -> None:
     with _download_lock:
         if jid == _job_id and _download["active"]:
             _download["active"] = False
+
+
+def _spawn_job(jid, target, *args) -> bool:
+    """Start a daemon worker for a freshly claimed job. If the thread fails to
+    start (e.g. resource exhaustion), release the slot so the single-job lane
+    isn't wedged until restart. Returns True on success, False on failure."""
+    try:
+        threading.Thread(target=target, args=args, daemon=True).start()
+        return True
+    except Exception as e:
+        log_line(f"[error] could not start worker thread: {e}")
+        _release_job(jid)
+        return False
 
 
 def _set_dl(_jid=None, **kw):
@@ -1187,17 +1311,23 @@ def download_status() -> dict:
 
 def _start_vllm(model: str, max_len_override: int = None) -> tuple:
     """Relaunch vLLM serve in the running container with the given model."""
+    model = _validate_hf_repo_id(model, "model")
     c = cfg()
-    max_len = max_len_override if max_len_override else c["MAX_MODEL_LEN"]
+    port = _validate_int_range(c["API_PORT"], "API_PORT", 1, 65535)
+    tp = _validate_int_range(c["TENSOR_PARALLEL"], "TENSOR_PARALLEL", 1, 8)
+    gpu_util = _validate_float_range(c["GPU_MEM_UTIL"], "GPU_MEM_UTIL", 0.1, 0.95)
+    max_len = _validate_int_range(max_len_override if max_len_override else c["MAX_MODEL_LEN"],
+                                  "MAX_MODEL_LEN", 512, 1048576)
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
-        f"vllm serve '{model}' --host 0.0.0.0 --port {c['API_PORT']} "
-        f"--tensor-parallel-size {c['TENSOR_PARALLEL']} --distributed-executor-backend ray "
-        f"--gpu-memory-utilization {c['GPU_MEM_UTIL']} --max-model-len {max_len} "
-        f"> /var/log/vllm.log 2>&1"
+        'exec vllm serve "$1" --host 0.0.0.0 --port "$2" '
+        '--tensor-parallel-size "$3" --distributed-executor-backend ray '
+        '--gpu-memory-utilization "$4" --max-model-len "$5" '
+        '> /var/log/vllm.log 2>&1'
     )
-    return run(["docker", "exec", "-d", CONTAINER, "bash", "-c", serve], timeout=15)
+    return run(["docker", "exec", "-d", CONTAINER, "bash", "-lc", serve,
+                "vllm-serve", model, port, tp, gpu_util, max_len], timeout=15)
 
 
 def _explain_error(log: str) -> str:
@@ -1242,6 +1372,8 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, j
                     _set_dl(_jid=jid, active=False, status="ready", percent=100,
                             detail=f"{model} is live and serving.", error=None)
                     log_line(f"[model] {model} is ready and serving")
+                    save_serving_state("vllm", model)
+                    invalidate_cache("engine_active", "library", "status", "metrics")
                     return True
             except Exception:
                 pass
@@ -1284,17 +1416,23 @@ _model_maxlen_cache = {}
 def _download_worker(model: str, auto_load: bool, jid=None):
     """Download weights into the cache with progress, then optionally load + watch."""
     global _download_proc
+    try:
+        model = _validate_hf_repo_id(model, "model")
+    except ValueError as e:
+        _set_dl(_jid=jid, active=False, status="error", error=str(e), detail=str(e))
+        return
     c = cfg()
     token = c.get("HF_TOKEN", "")
     _set_dl(_jid=jid, active=True, model=model, status="downloading", percent=0,
             detail=f"Preparing to download {model}...", speed="", error=None, started=time.time())
     log_line(f"[download] starting {model}")
 
-    env_prefix = f"HF_TOKEN={token} " if token else ""
-    cmd = f"{env_prefix}hf download '{model}' 2>&1"
-
+    cmd = ["docker", "exec"]
+    if token:
+        cmd += ["-e", f"HF_TOKEN={token}"]
+    cmd += [CONTAINER, "hf", "download", model]
     proc = subprocess.Popen(
-        ["docker", "exec", CONTAINER, "bash", "-lc", cmd],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     with _download_lock:
         _download_proc = proc
@@ -1370,6 +1508,11 @@ def currently_serving() -> str:
 
 def _load_worker(model: str, jid=None):
     """Load a cached model with rollback: if it fails, restore the previous one."""
+    try:
+        model = _validate_hf_repo_id(model, "model")
+    except ValueError as e:
+        _set_dl(_jid=jid, active=False, status="error", error=str(e), detail=str(e))
+        return
     previous = currently_serving()
     write_env_value(CLUSTER_ENV, "MODEL", model)
     _set_dl(_jid=jid, active=True, model=model, status="loading", percent=0,
@@ -1416,23 +1559,34 @@ def _load_worker(model: str, jid=None):
 
 
 def start_download(model: str, auto_load: bool = True):
+    try:
+        model = _validate_hf_repo_id(model, "model")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     jid, busy = _claim_job(model, status="downloading", detail=f"Preparing to download {model}...")
     if jid is None:
         return {"ok": False, "detail": busy}
-    threading.Thread(target=_download_worker, args=(model, auto_load, jid), daemon=True).start()
+    if not _spawn_job(jid, _download_worker, model, auto_load, jid):
+        return {"ok": False, "detail": "Could not start the download worker."}
     return {"ok": True, "detail": f"Download started for {model}."}
 
 
 def swap_model(model: str):
     """Cached -> load + watch (with rollback). Not cached -> download + auto-load."""
+    try:
+        model = _validate_hf_repo_id(model, "model")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     jid, busy = _claim_job(model, status="loading", detail=f"Loading {model}...")
     if jid is None:
         return {"ok": False, "detail": busy}
     cached = {m["id"] for m in hf_cache_models()}
     if model in cached:
-        threading.Thread(target=_load_worker, args=(model, jid), daemon=True).start()
+        if not _spawn_job(jid, _load_worker, model, jid):
+            return {"ok": False, "detail": "Could not start the load worker."}
         return {"ok": True, "detail": f"Loading cached {model}..."}
-    threading.Thread(target=_download_worker, args=(model, True, jid), daemon=True).start()
+    if not _spawn_job(jid, _download_worker, model, True, jid):
+        return {"ok": False, "detail": "Could not start the download worker."}
     return {"ok": True, "detail": f"Downloading then loading {model}..."}
 
 
@@ -1800,8 +1954,8 @@ def bring_from_nas(model_id: str) -> dict:
                            detail=f"Copying {model_id} from NAS to local...")
     if jid is None:
         return {"ok": False, "detail": busy}
-    threading.Thread(target=_nas_copy_worker,
-                     args=(model_id, m["path"], m["kind"], jid), daemon=True).start()
+    if not _spawn_job(jid, _nas_copy_worker, model_id, m["path"], m["kind"], jid):
+        return {"ok": False, "detail": "Could not start the NAS copy worker."}
     return {"ok": True, "detail": f"Copying {model_id} from NAS to local. Watch progress in the banner."}
 
 
@@ -1850,12 +2004,19 @@ def set_cache_path(new_path: str) -> dict:
     """Change the cache location in cluster.env (applies on next start)."""
     if not new_path.strip():
         return {"ok": False, "detail": "Empty path."}
+    try:
+        new_path = _validate_abs_path(new_path, "HF_CACHE_DIR")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     p = Path(new_path)
     try:
         p.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return {"ok": False, "detail": f"Could not create {new_path}: {e}"}
-    write_env_value(CLUSTER_ENV, "HF_CACHE_DIR", new_path)
+    try:
+        write_env_value(CLUSTER_ENV, "HF_CACHE_DIR", new_path)
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     log_line(f"[library] cache path set to {new_path}")
     return {"ok": True, "detail": f"Cache path set to {new_path}. Applies on next cluster start.",
             "needs_relaunch": True}
@@ -2041,6 +2202,13 @@ def active_engine() -> dict:
 
 def _llama_start_worker(repo: str, gguf_file: str, ctx: int, jid=None):
     """Download (if needed) + start llama.cpp in the background, reporting progress."""
+    try:
+        repo = _validate_hf_repo_id(repo, "repo") if repo else ""
+        gguf_file = _validate_gguf_filename(gguf_file, "GGUF file")
+        ctx = int(_validate_int_range(ctx, "ctx", 512, 1048576))
+    except ValueError as e:
+        _set_dl(_jid=jid, active=False, status="error", error=str(e), detail=str(e))
+        return
     script = str(KIT_DIR / "llama-serve.sh")
     _set_dl(_jid=jid, active=True, model=gguf_file, status="loading", percent=0,
             detail=f"Starting llama.cpp with {gguf_file} (downloads first if needed)...",
@@ -2078,11 +2246,18 @@ def start_llama(repo: str, gguf_file: str, ctx: int = 32768):
     script = str(KIT_DIR / "llama-serve.sh")
     if not Path(script).exists():
         return {"ok": False, "detail": "llama-serve.sh not found in cluster kit."}
+    try:
+        repo = _validate_hf_repo_id(repo, "repo") if repo else ""
+        gguf_file = _validate_gguf_filename(gguf_file, "GGUF file")
+        ctx = int(_validate_int_range(ctx, "ctx", 512, 1048576))
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     jid, busy = _claim_job(gguf_file, status="loading",
                            detail=f"Starting llama.cpp with {gguf_file}...")
     if jid is None:
         return {"ok": False, "detail": busy}
-    threading.Thread(target=_llama_start_worker, args=(repo, gguf_file, ctx, jid), daemon=True).start()
+    if not _spawn_job(jid, _llama_start_worker, repo, gguf_file, ctx, jid):
+        return {"ok": False, "detail": "Could not start the llama.cpp worker."}
     return {"ok": True, "detail": f"Starting llama.cpp with {gguf_file}. Watch progress in the banner."}
 
 
@@ -2144,10 +2319,16 @@ def start_dflash(model: str, draft: str):
     script = str(KIT_DIR / "vllm-dflash-serve.sh")
     if not Path(script).exists():
         return {"ok": False, "detail": "vllm-dflash-serve.sh not found in cluster kit."}
+    try:
+        model = _validate_hf_repo_id(model, "model")
+        draft = _validate_hf_repo_id(draft, "draft")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     jid, busy = _claim_job(model, status="loading", detail=f"Starting vLLM+DFlash for {model}...")
     if jid is None:
         return {"ok": False, "detail": busy}
-    threading.Thread(target=_dflash_start_worker, args=(model, draft, jid), daemon=True).start()
+    if not _spawn_job(jid, _dflash_start_worker, model, draft, jid):
+        return {"ok": False, "detail": "Could not start the vLLM+DFlash worker."}
     return {"ok": True, "detail": f"Starting vLLM+DFlash for {model}. First load is slow (~54GB); watch the banner."}
 
 
@@ -2198,6 +2379,10 @@ def list_local_images() -> list:
 
 
 def check_ngc_tag(tag: str) -> dict:
+    try:
+        tag = _validate_image_tag(tag, "image tag")
+    except ValueError as e:
+        return {"tag": tag, "available": False, "reason": str(e)}
     rc, out, err = run(["docker", "manifest", "inspect", f"{NGC_REPO}:{tag}"], timeout=25)
     blob = (out + err).lower()
     if rc == 0:
@@ -2260,6 +2445,10 @@ def start_image_update(ngc_tag: str):
     with _image_lock:
         if _image_job["active"]:
             return {"ok": False, "detail": "An image job is already running."}
+    try:
+        ngc_tag = _validate_image_tag(ngc_tag, "image tag")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     chk = check_ngc_tag(ngc_tag)
     if not chk["available"]:
         return {"ok": False, "detail": f"Tag {ngc_tag} unavailable: {chk.get('reason')}"}
@@ -2268,11 +2457,18 @@ def start_image_update(ngc_tag: str):
 
 
 def switch_image(ngc_tag: str):
+    try:
+        ngc_tag = _validate_image_tag(ngc_tag, "image tag")
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     local = f"{LOCAL_IMAGE_TAG}:{ngc_tag}"
     rc, _, _ = run(["docker", "image", "inspect", local], timeout=10)
     if rc != 0:
         return {"ok": False, "detail": f"{local} not built yet. Update first."}
-    write_env_value(CLUSTER_ENV, "VLLM_IMAGE", local)
+    try:
+        write_env_value(CLUSTER_ENV, "VLLM_IMAGE", local)
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     log_line(f"[image] switching cluster to {local} (relaunch required)")
     return {"ok": True, "detail": f"Set to {local}. Stop then Start to relaunch on the new image.",
             "needs_relaunch": True}
@@ -2378,9 +2574,10 @@ def api_config(payload: dict = Body(...)):
         if key in payload and str(payload[key]) != "":
             try:
                 value = cast(payload[key])
-            except (ValueError, TypeError):
-                return JSONResponse({"ok": False, "detail": f"Invalid value for {key}"}, status_code=400)
-            write_env_value(CLUSTER_ENV, key, str(value))
+                write_env_value(CLUSTER_ENV, key, str(value))
+            except (ValueError, TypeError) as e:
+                detail = str(e) if str(e) else f"Invalid value for {key}"
+                return JSONResponse({"ok": False, "detail": detail}, status_code=400)
             applied[key] = value
     log_line(f"[config] updated {', '.join(applied)} (restart to apply)")
     return JSONResponse({"ok": True, "applied": applied,
@@ -2420,6 +2617,16 @@ def pick_gguf_file(files: list, prefer: str = None) -> str:
 def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
     """Engine-agnostic load: detect format, route to vLLM or llama.cpp.
     Runs the actual work in a background thread so the request returns immediately."""
+    try:
+        if model.lower().endswith(".gguf"):
+            model = _validate_gguf_filename(model, "model")
+        else:
+            model = _validate_hf_repo_id(model, "model")
+        if gguf_file:
+            gguf_file = _validate_gguf_filename(gguf_file, "GGUF file")
+        ctx = int(_validate_int_range(ctx, "ctx", 512, 1048576))
+    except ValueError as e:
+        return {"ok": False, "detail": str(e)}
     jid, busy = _claim_job(model, status="loading", detail=f"Loading {model}...")
     if jid is None:
         return {"ok": False, "detail": busy}
@@ -2475,7 +2682,8 @@ def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
         else:
             _download_worker(model, True, jid)
 
-    threading.Thread(target=_route_worker, daemon=True).start()
+    if not _spawn_job(jid, _route_worker):
+        return {"ok": False, "detail": "Could not start the model-routing worker."}
     return {"ok": True, "detail": f"Loading {model}. Watch progress in the activity log.", "async": True}
 
 
@@ -2561,7 +2769,10 @@ def api_nas_models():
 @app.post("/api/nas/path")
 def api_nas_path(payload: dict = Body(...)):
     path = (payload.get("path") or "").strip()
-    write_env_value(CLUSTER_ENV, "NAS_PATH", path)
+    try:
+        write_env_value(CLUSTER_ENV, "NAS_PATH", path)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=400)
     invalidate_cache("nas")
     s = nas_status()
     return JSONResponse({"ok": True, "detail": f"NAS path set to {path}." if path else "NAS path cleared.",
@@ -2667,11 +2878,26 @@ def api_benchmark_history():
     return JSONResponse({"benchmarks": benchmark_history()})
 
 
+# Shared async HTTP client for the engine proxies. Lazily created inside the
+# running event loop (uvicorn's), with a long read timeout for slow first tokens
+# and a short connect timeout so a dead engine fails fast instead of hanging.
+_httpx_client = None
+
+
+def _engine_client() -> httpx.AsyncClient:
+    global _httpx_client
+    if _httpx_client is None:
+        _httpx_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0))
+    return _httpx_client
+
+
 @app.post("/api/chat")
-def api_chat(payload: dict = Body(...)):
+async def api_chat(payload: dict = Body(...)):
     """Streaming chat proxy to whichever engine is serving. Keeps the browser
-    single-origin; the frontend times TTFT (first token) and tok/s off this stream."""
-    eng = active_engine()
+    single-origin; the frontend times TTFT (first token) and tok/s off this stream.
+    Async + httpx so a long generation never blocks the event loop."""
+    eng = await run_in_threadpool(active_engine)
     port = eng.get("port") or cfg().get("API_PORT", "8000")
     model = eng.get("model")
     if not model:
@@ -2692,15 +2918,12 @@ def api_chat(payload: dict = Body(...)):
             req_body["temperature"] = max(0.0, min(2.0, float(payload["temperature"])))
         except (TypeError, ValueError):
             pass
-    body = json.dumps(req_body).encode()
+    target = f"http://localhost:{port}/v1/chat/completions"
 
-    def gen():
-        import urllib.request
-        req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions",
-                                     data=body, headers={"Content-Type": "application/json"})
+    async def gen():
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                for raw in resp:
+            async with _engine_client().stream("POST", target, json=req_body) as resp:
+                async for raw in resp.aiter_raw():
                     yield raw
         except Exception as e:
             yield ("data: " + json.dumps({"error": str(e)[:200]}) + "\n\n").encode()
@@ -2713,49 +2936,80 @@ def api_chat(payload: dict = Body(...)):
 # http://localhost:<panel-port>/v1 as a single OpenAI connection and it always
 # sees the current model — no per-engine connection juggling.
 # ------------------------------------------------------------
-@app.get("/v1/models")
-def v1_models():
-    eng = active_engine()
-    port = eng.get("port")
-    if not port:
+def _engine_unavailable_response(path: str):
+    if path == "models":
         return JSONResponse({"object": "list", "data": []})
-    import urllib.request
+    return JSONResponse(
+        {"error": {"message": "No model is serving. Load one from the GX10 panel.",
+                   "type": "service_unavailable"}}, status_code=503)
+
+
+def _wants_stream(body: bytes, headers) -> bool:
+    ctype = headers.get("content-type", "")
+    if "application/json" not in ctype or not body:
+        return False
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/v1/models", timeout=10) as r:
-            return JSONResponse(json.loads(r.read()))
+        payload = json.loads(body.decode("utf-8"))
     except Exception:
-        return JSONResponse({"object": "list", "data": []})
+        return False
+    return bool(payload.get("stream"))
 
 
-@app.post("/v1/chat/completions")
-def v1_chat_completions(payload: dict = Body(...)):
-    eng = active_engine()
+def _proxy_headers(request: Request) -> dict:
+    out = {}
+    for key in ("accept", "authorization", "content-type"):
+        val = request.headers.get(key)
+        if val:
+            out[key.title()] = val
+    return out
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST"])
+async def v1_passthrough(path: str, request: Request):
+    """Async catch-all OpenAI passthrough. httpx + async so a streaming generation
+    never blocks the event loop (the prior urllib version, in an async handler,
+    stalled all concurrent requests for the whole generation)."""
+    path = path.strip("/")
+    eng = await run_in_threadpool(active_engine)   # blocking curl, kept off the loop
     port = eng.get("port")
     if not port:
-        return JSONResponse(
-            {"error": {"message": "No model is serving. Load one from the GX10 panel.",
-                       "type": "service_unavailable"}}, status_code=503)
-    body = json.dumps(payload).encode()
-    import urllib.request, urllib.error
-    req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions",
-                                 data=body, headers={"Content-Type": "application/json"})
-    if payload.get("stream"):
-        def gen():
+        return _engine_unavailable_response(path)
+    target = f"http://localhost:{port}/v1/{path}"
+    if request.url.query:
+        target += f"?{request.url.query}"
+    body = await request.body()
+    data = body if request.method != "GET" else None
+    client = _engine_client()
+
+    if _wants_stream(body, request.headers):
+        # Open the upstream stream first so we can mirror its status + content-type
+        # onto the StreamingResponse before any bytes flow, then relay chunks.
+        req = client.build_request(request.method, target, content=data,
+                                   headers=_proxy_headers(request))
+        try:
+            resp = await client.send(req, stream=True)
+        except Exception as e:
+            return JSONResponse({"error": {"message": str(e)[:200]}}, status_code=502)
+        ctype = resp.headers.get("content-type", "text/event-stream")
+
+        async def gen():
             try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    for raw in resp:
-                        yield raw
+                async for raw in resp.aiter_raw():
+                    yield raw
             except Exception as e:
                 yield ("data: " + json.dumps({"error": str(e)[:200]}) + "\n\n").encode()
-        return StreamingResponse(gen(), media_type="text/event-stream")
+            finally:
+                await resp.aclose()
+        return StreamingResponse(gen(), status_code=resp.status_code,
+                                 headers={"content-type": ctype})
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return JSONResponse(json.loads(resp.read()))
-    except urllib.error.HTTPError as e:
-        return JSONResponse({"error": {"message": e.read().decode("utf-8", "ignore")[:300]}},
-                            status_code=e.code)
+        resp = await client.request(request.method, target, content=data,
+                                    headers=_proxy_headers(request))
     except Exception as e:
         return JSONResponse({"error": {"message": str(e)[:200]}}, status_code=502)
+    ctype = resp.headers.get("content-type", "application/json")
+    return Response(content=resp.content, status_code=resp.status_code,
+                    headers={"content-type": ctype})
 
 
 @app.get("/api/engine/active")
