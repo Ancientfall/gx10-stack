@@ -1491,6 +1491,9 @@ def _start_vllm(model: str, max_len_override: int = None, batched_override: int 
 def _explain_error(log: str) -> str:
     """Turn a raw vLLM error into a plain-language reason."""
     low = log.lower()
+    if "notimplementederror" in low and ("nvfp4" in low or "fp4" in low or "moe" in low):
+        return ("This NVFP4 MoE model uses a quant kernel path this vLLM build can't run "
+                "(NvFp4 CUTLASS). Use an FP8/BF16 or GGUF build of the model, or a newer vLLM image.")
     if "keyerror" in low and ("_scale" in low or "experts" in low):
         return "Model uses a quantization format this vLLM build can't load (missing weight mapping). Needs a newer vLLM image."
     if "derived max_model_len" in low:
@@ -1503,12 +1506,17 @@ def _explain_error(log: str) -> str:
         return "Model needs a dependency this image doesn't have. Needs a newer vLLM image."
     if "trust_remote_code" in low:
         return "Model requires trust_remote_code, which isn't enabled."
-    # fall back to the most specific error line
+    # fall back to the most specific exception line, skipping the generic engine-core
+    # wrapper (the real cause is "above" it in the traceback)
+    generic = ("engine core initialization failed", "see root cause above", "failed core proc")
     for l in log.splitlines()[::-1]:
         ll = l.lower()
-        if any(k in ll for k in ("error:", "valueerror", "runtimeerror", "keyerror", "assert")):
-            return re.sub(r"^.*?((Value|Runtime|Key|OS)Error|AssertionError|Error)", r"\1", l).strip()[:200]
-    return "Engine failed to start. See vLLM logs for details."
+        if any(g in ll for g in generic):
+            continue
+        if any(k in ll for k in ("notimplementederror", "error:", "valueerror", "runtimeerror",
+                                 "keyerror", "assertionerror")):
+            return re.sub(r"^.*?((NotImplemented|Value|Runtime|Key|OS|Assertion)Error)", r"\1", l).strip()[:220]
+    return "Engine failed to start. See the Engine Logs for details."
 
 
 def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _attempt=0, jid=None) -> bool:
