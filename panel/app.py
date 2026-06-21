@@ -56,6 +56,12 @@ CLUSTER_ENV = KIT_DIR / "cluster.env"
 NODE_CONF = Path("/etc/gx10-cluster.conf")
 CONTAINER = "vllm-node"
 LAUNCH_SCRIPT = KIT_DIR / "02-launch-cluster.sh"
+# Single-node vLLM + DFlash speculative decoding (vllm-dflash-serve.sh) runs in its
+# own container, distinct from the multi-node Ray cluster (CONTAINER above). When a
+# base model in DFLASH_PAIRS is loaded and its draft is cached, the panel serves it
+# this way (vLLM on the same API port, so it's detected as the vLLM engine).
+DFLASH_CONTAINER = "vllm-dflash"
+DFLASH_PAIRS = {"Qwen/Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash"}
 
 PANEL_HOST = os.environ.get("GX10_PANEL_HOST", "0.0.0.0")
 PANEL_PORT = int(os.environ.get("GX10_PANEL_PORT", "8080"))
@@ -1414,6 +1420,8 @@ def unload_model():
         if _download["active"]:
             return {"ok": False, "detail": "A job is running; use Cancel to stop it first."}
     rc, _, _ = run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
+    # also tear down the single-node vLLM+DFlash container if it's the one serving
+    run(["docker", "rm", "-f", DFLASH_CONTAINER], timeout=20)
     _set_dl(active=False, status="idle", model=None, percent=0, detail="", error=None)
     invalidate_cache("library", "engine_active", "status", "metrics")
     log_line("[model] unloaded (vLLM serve stopped)")
@@ -1791,11 +1799,19 @@ def library_all() -> dict:
     serving = currently_serving()      # vLLM API actually responding with this id
     llama = llama_serving()            # llama.cpp actually serving
     configured = cfg().get("MODEL", "")
+    st_models = hf_cache_models()
+    cached_ids = {m["id"] for m in st_models}
+    draft_ids = set(DFLASH_PAIRS.values())
     def mk(m, eng):
         is_serving = (m["id"] == serving) or (m["id"] == llama)
-        return {**m, "engine": eng, "active": is_serving,
-                "configured": m["id"] == configured and not is_serving}
-    st = [mk(m, "vllm") for m in hf_cache_models()]
+        out = {**m, "engine": eng, "active": is_serving,
+               "configured": m["id"] == configured and not is_serving}
+        if m["id"] in draft_ids:
+            out["is_draft"] = True            # speculative draft, not loadable on its own
+        if m["id"] in DFLASH_PAIRS:
+            out["dflash"] = DFLASH_PAIRS[m["id"]] in cached_ids  # base with draft available
+        return out
+    st = [mk(m, "vllm") for m in st_models]
     gg = [mk(m, "llamacpp") for m in gguf_cache_models()]
     items = sorted(st + gg, key=lambda x: -(x.get("size_gb") or 0))
     return {"models": items, "storage": storage_usage()}
@@ -2005,6 +2021,69 @@ def stop_llama():
     run(["bash", script, "stop"], timeout=20)
     log_line("[llama] stopped")
     return {"ok": True, "detail": "llama.cpp server stopped."}
+
+
+def dflash_draft_for(model: str):
+    """Return the DFlash draft repo for `model` if it's paired AND the draft is cached
+    locally, else None. Used to route a base-model load to single-node vLLM+DFlash."""
+    draft = DFLASH_PAIRS.get(model)
+    if not draft:
+        return None
+    cached = {m["id"] for m in hf_cache_models()}
+    return draft if draft in cached else None
+
+
+def _dflash_start_worker(model: str, draft: str, jid=None):
+    """Start single-node vLLM+DFlash in the background, reporting progress. The BF16
+    base is large (~54GB), so first load takes several minutes before it answers."""
+    script = str(KIT_DIR / "vllm-dflash-serve.sh")
+    _set_dl(_jid=jid, active=True, model=model, status="loading", percent=0,
+            detail=f"Starting vLLM+DFlash for {model} (loading ~54GB base; first start is slow)...",
+            started=time.time(), error=None)
+    log_line(f"[dflash] starting {model} (draft {draft})")
+    cmd = (f"DFLASH_MODEL={shlex.quote(model)} DFLASH_DRAFT={shlex.quote(draft)} "
+           f"bash {shlex.quote(script)} start")
+    rc, out, err = run(["bash", "-c", cmd], timeout=600)
+    if jid is not None and not _job_is_current(jid):
+        return
+    if rc != 0:
+        msg = (err or out or "unknown error")[:240]
+        _set_dl(_jid=jid, active=False, status="error", error=f"vLLM+DFlash failed: {msg}")
+        log_line(f"[dflash] start failed: {msg}")
+        invalidate_cache("engine_active", "library")
+        return
+    # wait (up to ~9 min) for the API to actually answer before calling it ready
+    for _ in range(180):
+        if jid is not None and not _job_is_current(jid):
+            return
+        if currently_serving():
+            _set_dl(_jid=jid, active=False, status="ready", percent=100,
+                    detail=f"vLLM+DFlash serving {model}.", error=None)
+            log_line(f"[dflash] {model} is serving")
+            invalidate_cache("engine_active", "library")
+            return
+        time.sleep(3)
+    _set_dl(_jid=jid, active=False, status="ready", detail=f"vLLM+DFlash started {model}; warming up.")
+    invalidate_cache("engine_active", "library")
+
+
+def start_dflash(model: str, draft: str):
+    """Launch single-node vLLM + DFlash (async: load + start in background)."""
+    script = str(KIT_DIR / "vllm-dflash-serve.sh")
+    if not Path(script).exists():
+        return {"ok": False, "detail": "vllm-dflash-serve.sh not found in cluster kit."}
+    jid, busy = _claim_job(model, status="loading", detail=f"Starting vLLM+DFlash for {model}...")
+    if jid is None:
+        return {"ok": False, "detail": busy}
+    threading.Thread(target=_dflash_start_worker, args=(model, draft, jid), daemon=True).start()
+    return {"ok": True, "detail": f"Starting vLLM+DFlash for {model}. First load is slow (~54GB); watch the banner."}
+
+
+def stop_dflash():
+    script = str(KIT_DIR / "vllm-dflash-serve.sh")
+    run(["bash", script, "stop"], timeout=30)
+    log_line("[dflash] stopped")
+    return {"ok": True, "detail": "vLLM+DFlash stopped."}
 
 
 
@@ -2301,7 +2380,17 @@ def route_model(model: str, gguf_file: str = None, ctx: int = 32768) -> dict:
             # run the llama start+download inline (we're already in a worker thread)
             _llama_start_worker(model, chosen, ctx, jid)
             return
-        # vLLM path
+        # vLLM path. If this base model has a cached DFlash draft, serve it single-node
+        # via vLLM + DFlash speculative decoding (faster on code/structured output) rather
+        # than the multi-node Ray cluster path.
+        draft = dflash_draft_for(model)
+        if draft:
+            if llama_serving():
+                log_line("[engine] stopping llama.cpp to free the box for vLLM+DFlash")
+                _set_dl(_jid=jid, active=True, model=model, status="loading", detail="Stopping llama.cpp...")
+                stop_llama()
+            _dflash_start_worker(model, draft, jid)
+            return
         if llama_serving():
             log_line("[engine] stopping llama.cpp to free the box for vLLM")
             _set_dl(_jid=jid, active=True, model=model, status="loading", detail="Stopping llama.cpp...")
