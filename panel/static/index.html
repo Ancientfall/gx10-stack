@@ -470,6 +470,24 @@
   .alert.warn { background: rgba(255,159,10,0.13); border: 1px solid rgba(255,159,10,0.4); color: #ffc868; }
   .alert.err { background: rgba(255,69,58,0.14); border: 1px solid rgba(255,69,58,0.45); color: #ff9a92; }
 
+  /* command palette (⌘K) */
+  .pal-overlay { position: fixed; inset: 0; z-index: 200; background: rgba(0,2,6,0.5); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 20px 20px; opacity: 0; transition: opacity var(--dur) var(--ease); }
+  .pal-overlay[hidden] { display: none; }
+  .pal-overlay.show { opacity: 1; }
+  .pal { width: 100%; max-width: 560px; background: var(--panel); backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); border: 1px solid var(--line-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-3); overflow: hidden; transform: scale(0.97) translateY(-6px); transition: transform var(--dur) var(--ease); }
+  .pal-overlay.show .pal { transform: none; }
+  .pal-input { width: 100%; border: none; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); font-family: var(--sans); font-size: 16px; padding: 16px 18px; outline: none; }
+  .pal-input::placeholder { color: var(--dim); }
+  .pal-list { max-height: 46vh; overflow-y: auto; padding: 6px; }
+  .pal-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 13px; border-radius: var(--r-sm); cursor: pointer; font-size: 14px; color: var(--text); }
+  .pal-item.sel { background: var(--accent); color: var(--on-accent); }
+  .pal-item.sel .pal-hint { color: rgba(255,255,255,0.8); }
+  .pal-hint { font-size: 11px; color: var(--dim); text-transform: capitalize; flex: none; }
+  .pal-empty { padding: 18px; text-align: center; color: var(--dim); font-size: 13px; }
+  .pal-foot { display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--line); font-size: 11px; color: var(--dim); }
+  .pal-foot kbd { font-family: var(--mono); background: rgba(255,255,255,0.07); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 10px; }
+  @media (prefers-reduced-motion: reduce) { .pal-overlay, .pal { transition: none; } }
+
   /* ============ Apple foundation: focus, materials, motion, skeletons ============ */
   /* unified soft focus ring on every text control */
   input:focus-visible, textarea:focus-visible, select:focus-visible {
@@ -866,6 +884,14 @@
       <button id="modal-cancel">Cancel</button>
       <button id="modal-confirm" class="primary">Confirm</button>
     </div>
+  </div>
+</div>
+
+<div class="pal-overlay" id="pal-overlay" hidden>
+  <div class="pal" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input id="pal-input" type="text" placeholder="Search commands, models, actions…  (⌘K)" spellcheck="false" autocomplete="off" aria-label="Command palette search" />
+    <div class="pal-list" id="pal-list"></div>
+    <div class="pal-foot"><span><kbd>↑↓</kbd> navigate</span><span><kbd>↵</kbd> run</span><span><kbd>esc</kbd> close</span></div>
   </div>
 </div>
 
@@ -1567,7 +1593,7 @@ $("lib-selbar-clear").onclick = () => { librarySelected = null; loadLibrary(); }
 const runSearch = async () => {
   const q = $("search-input").value.trim();
   if (!q) return;
-  $("search-list").innerHTML = '<p class="hint">Searching Hugging Face...</p>';
+  $("search-list").innerHTML = `<div class="mlist-grid">${Array.from({length:6}).map(()=>'<div class="mcard"><div class="skeleton sk-row" style="width:62%"></div><div class="skeleton sk-row" style="width:38%"></div><div class="skeleton sk-row" style="height:28px;margin-top:8px"></div></div>').join("")}</div>`;
   try {
     const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
     pageState["search-list"] = 0;
@@ -2392,6 +2418,74 @@ setInterval(() => {
     pollStatus(); pollActivity(); pollMetrics(); pollTelemetry(); pollDownload(); updateNowServing(); pollEngines();
   }
 }, 20000);
+
+// ---------- command palette (⌘K) ----------
+let _palItems = [], _palSel = 0, _palModels = null, _palOpen = false;
+const palStatic = () => [
+  { label: "Go to Monitor", hint: "tab", run: () => switchTab("monitor") },
+  { label: "Go to Serve", hint: "tab", run: () => switchTab("serve") },
+  { label: "Go to Playground", hint: "tab", run: () => switchTab("playground") },
+  { label: "Go to Manage", hint: "tab", run: () => switchTab("manage") },
+  { label: "Start cluster", hint: "action", run: () => $("btn-start").click() },
+  { label: "Stop cluster", hint: "action", run: () => $("btn-stop").click() },
+  { label: "Optimize & fix", hint: "action", run: () => $("btn-optimize").click() },
+  { label: "Unload model", hint: "action", run: () => { const b = $("btn-unload"); if (b) b.click(); } },
+];
+const loadPalModels = async () => {
+  if (_palModels) return _palModels;
+  const ids = new Set(), items = [];
+  try {
+    const c = await api("/api/models/curated");
+    (c.models || c || []).forEach((m) => {
+      if (m.id && !ids.has(m.id)) {
+        ids.add(m.id);
+        items.push({ label: `Load ${m.id}`, hint: m.cached ? "cached" : (m.recommended ? "recommended" : "model"), run: () => palLoad(m.id) });
+      }
+    });
+  } catch (e) {}
+  _palModels = items; return items;
+};
+const palLoad = (id) => {
+  api("/api/model", "POST", { model: id })
+    .then((r) => { if (r && r.ok === false) toast(r.detail || "Load failed.", { error: true }); else toast(`Loading ${id}…`); pollDownload(); pollActivity(); })
+    .catch((e) => toastError("Load failed", e));
+};
+const renderPal = () => {
+  const list = $("pal-list");
+  if (!_palItems.length) { list.innerHTML = '<div class="pal-empty">No matches</div>'; return; }
+  list.innerHTML = _palItems.map((it, i) =>
+    `<div class="pal-item ${i === _palSel ? "sel" : ""}" data-i="${i}"><span>${escapeHtml(it.label)}</span><span class="pal-hint">${escapeHtml(it.hint || "")}</span></div>`).join("");
+  const sel = list.querySelector(".pal-item.sel"); if (sel) sel.scrollIntoView({ block: "nearest" });
+  list.querySelectorAll(".pal-item").forEach((el) => {
+    el.onmousemove = () => { const i = +el.getAttribute("data-i"); if (i !== _palSel) { _palSel = i; renderPal(); } };
+    el.onclick = () => { _palSel = +el.getAttribute("data-i"); runPal(); };
+  });
+};
+const filterPal = (q) => {
+  q = (q || "").toLowerCase().trim();
+  const all = palStatic().concat(_palModels || []);
+  _palItems = q ? all.filter((it) => it.label.toLowerCase().includes(q)) : all;
+  _palSel = 0; renderPal();
+};
+const runPal = () => { const it = _palItems[_palSel]; closePal(); if (it) it.run(); };
+const openPal = () => {
+  if (_palOpen) return; _palOpen = true;
+  const ov = $("pal-overlay"); ov.hidden = false; requestAnimationFrame(() => ov.classList.add("show"));
+  const inp = $("pal-input"); inp.value = ""; inp.focus();
+  filterPal(""); loadPalModels().then(() => { if (_palOpen) filterPal($("pal-input").value); });
+};
+const closePal = () => { if (!_palOpen) return; _palOpen = false; const ov = $("pal-overlay"); ov.classList.remove("show"); setTimeout(() => { ov.hidden = true; }, 180); };
+$("pal-input").addEventListener("input", (e) => filterPal(e.target.value));
+$("pal-input").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); _palSel = Math.min(_palSel + 1, _palItems.length - 1); renderPal(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); _palSel = Math.max(_palSel - 1, 0); renderPal(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPal(); }
+  else if (e.key === "Escape") { e.preventDefault(); closePal(); }
+});
+$("pal-overlay").addEventListener("click", (e) => { if (e.target === $("pal-overlay")) closePal(); });
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); _palOpen ? closePal() : openPal(); }
+});
 </script>
 </body>
 </html>
