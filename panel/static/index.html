@@ -1113,9 +1113,18 @@ const modelCard = (m, opts = {}) => {
   if (opts.downloads != null) tags.push(`<span class="tag">${fmtNum(m.downloads)} downloads</span>`);
   const canLoad = m.fit !== "toobig";
   const modelId = escapeHtml(m.id);
-  const loadBtn = m.active
-    ? '<span class="tag single">active</span>'
-    : (canLoad ? `<button data-model="${modelId}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "");
+  let loadBtn;
+  if (m.active) {
+    loadBtn = '<span class="tag single">active</span>';
+  } else if (opts.downloadOnly) {
+    // Discover: download only — fetching weights must never disturb the running
+    // engine. Loading happens deliberately from the Library tab once it's local.
+    loadBtn = m.cached
+      ? '<span class="tag single">in Library</span>'
+      : (canLoad ? `<button data-model="${modelId}" class="dl-model">Download</button>` : "");
+  } else {
+    loadBtn = canLoad ? `<button data-model="${modelId}" class="load-model">${m.cached ? "Load" : "Download & load"}</button>` : "";
+  }
   const note = m.note ? `<div class="mnote">${escapeHtml(m.note)}</div>` : "";
   return `<div class="mcard ${m.active ? "active" : ""}">
     <div class="mid">${modelId}</div>
@@ -1170,6 +1179,33 @@ const wireLoadButtons = (container) => {
   });
 };
 
+// Discover: download-only. Fetches weights into the cache without touching the
+// running engine — no preload-check, no confirm, non-disruptive. The user then
+// loads it deliberately from the Library tab. The global banner tracks progress.
+const wireDownloadButtons = (container) => {
+  container.querySelectorAll(".dl-model").forEach((btn) => {
+    btn.onclick = async () => {
+      if (btn.disabled) return;
+      const model = btn.getAttribute("data-model");
+      const original = btn.textContent;
+      btn.disabled = true; btn.textContent = "Downloading…";
+      try {
+        const r = await api("/api/download", "POST", { model, auto_load: false });
+        if (r.ok === false) {
+          toast(r.detail || "Couldn't start download.", { error: true });
+          btn.disabled = false; btn.textContent = original;
+        } else {
+          toast(r.detail || "Download started — track it in the banner above.");
+        }
+      } catch (e) {
+        toastError("Download failed", e);
+        btn.disabled = false; btn.textContent = original;
+      }
+      pollDownload(); pollActivity();
+    };
+  });
+};
+
 // Generic paginator: renders a slice of `items` into `listId`, with controls.
 // State is stored per-list so each tab pages independently.
 const PAGE_SIZE = 9;
@@ -1194,6 +1230,7 @@ const renderPaged = (listId, items, cardFn, emptyMsg, opts = {}) => {
 
   list.innerHTML = `<div class="mlist-grid">${cards}</div>${controls}`;
   wireLoadButtons(list);
+  wireDownloadButtons(list);
   const prev = list.querySelector(".pg-prev"), next = list.querySelector(".pg-next");
   if (prev) prev.onclick = () => { pageState[listId] = Math.max(0, page - 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
   if (next) next.onclick = () => { pageState[listId] = Math.min(pages - 1, page + 1); renderPaged(listId, items, cardFn, emptyMsg, opts); };
@@ -1427,7 +1464,7 @@ const runSearch = async () => {
   try {
     const r = await api(`/api/models/search?q=${encodeURIComponent(q)}`);
     pageState["search-list"] = 0;
-    renderPaged("search-list", r.results || [], (m) => modelCard(m, { downloads: m.downloads }), "No results. Try different terms.");
+    renderPaged("search-list", r.results || [], (m) => modelCard(m, { downloads: m.downloads, downloadOnly: true }), "No results. Try different terms.");
   } catch (e) {
     $("search-list").innerHTML = `<p class="hint">${escapeHtml("Search failed: " + (e.message || "unknown error"))}</p>`;
     toastError("Search failed", e);

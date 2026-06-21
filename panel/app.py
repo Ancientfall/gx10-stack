@@ -1318,6 +1318,9 @@ def _start_vllm(model: str, max_len_override: int = None) -> tuple:
     gpu_util = _validate_float_range(c["GPU_MEM_UTIL"], "GPU_MEM_UTIL", 0.1, 0.95)
     max_len = _validate_int_range(max_len_override if max_len_override else c["MAX_MODEL_LEN"],
                                   "MAX_MODEL_LEN", 512, 1048576)
+    if CONTAINER not in _running_container_names():
+        return (127, "", "The multi-node vLLM cluster isn't running. Click Start to bring it up, then "
+                         "load this model — or pick a GGUF model to run single-node on llama.cpp.")
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
     serve = (
@@ -1413,6 +1416,36 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, j
 _model_maxlen_cache = {}
 
 
+def _running_container_names() -> set:
+    """Names of currently-running docker containers."""
+    rc, out, _ = run(["docker", "ps", "--format", "{{.Names}}"], timeout=8)
+    return set((out or "").split()) if rc == 0 else set()
+
+
+def _hf_download_command(model: str, token: str) -> list:
+    """Build a command that downloads `model` into the HF cache regardless of which
+    engine (if any) is serving. Prefer exec'ing into a running vLLM-family container
+    (it has `hf` and the cache mounted); otherwise spin a transient `docker run --rm`
+    downloader so a download never depends on the multi-node cluster being up. This
+    fixes downloads failing with a cryptic 'exit 1' (No such container: vllm-node)
+    whenever the cluster isn't started (DFlash / llama.cpp / idle)."""
+    running = _running_container_names()
+    target = next((n for n in (CONTAINER, DFLASH_CONTAINER) if n in running), "")
+    if target:
+        cmd = ["docker", "exec"]
+        if token:
+            cmd += ["-e", f"HF_TOKEN={token}"]
+        cmd += [target, "hf", "download", model]
+        return cmd
+    c = cfg()
+    cache = c.get("HF_CACHE_DIR") or str(Path.home() / "hf-cache")
+    cmd = ["docker", "run", "--rm", "-v", f"{cache}:/root/.cache/huggingface"]
+    if token:
+        cmd += ["-e", f"HF_TOKEN={token}"]
+    cmd += ["--entrypoint", "hf", c["VLLM_IMAGE"], "download", model]
+    return cmd
+
+
 def _download_worker(model: str, auto_load: bool, jid=None):
     """Download weights into the cache with progress, then optionally load + watch."""
     global _download_proc
@@ -1427,10 +1460,7 @@ def _download_worker(model: str, auto_load: bool, jid=None):
             detail=f"Preparing to download {model}...", speed="", error=None, started=time.time())
     log_line(f"[download] starting {model}")
 
-    cmd = ["docker", "exec"]
-    if token:
-        cmd += ["-e", f"HF_TOKEN={token}"]
-    cmd += [CONTAINER, "hf", "download", model]
+    cmd = _hf_download_command(model, token)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -1441,12 +1471,14 @@ def _download_worker(model: str, auto_load: bool, jid=None):
     pat_pct = re.compile(r'(\d+)%')
     pat_speed = re.compile(r'([\d.]+[KMG]B/s)')
     saw_error = None
+    tail_buf = collections.deque(maxlen=8)   # keep recent output to surface real errors
     for line in proc.stdout:
         if jid is not None and not _job_is_current(jid):
             break  # cancelled/superseded: stop reading; cancel_load kills the proc
         line = line.strip()
         if not line:
             continue
+        tail_buf.append(line)
         low = line.lower()
         if "401" in line or "gated" in low or "awaiting a review" in low or "restricted" in low or "authentication" in low:
             saw_error = "Model is gated. Set HF_TOKEN in cluster.env and request access on Hugging Face."
@@ -1454,6 +1486,10 @@ def _download_worker(model: str, auto_load: bool, jid=None):
             saw_error = "Model not found. Check the exact repo id."
         elif "no space left" in low:
             saw_error = "Out of disk space in the cache volume."
+        elif "no such container" in low or "error response from daemon" in low:
+            saw_error = f"Download container error: {line[:160]}"
+        elif "unable to find image" in low or "manifest unknown" in low or "pull access denied" in low:
+            saw_error = f"Downloader image unavailable: {line[:160]}"
         m = pat_pct.search(line)
         if m:
             pct = int(m.group(1))
@@ -1473,7 +1509,9 @@ def _download_worker(model: str, auto_load: bool, jid=None):
         return
 
     if saw_error or proc.returncode != 0:
-        msg = saw_error or f"Download failed (exit {proc.returncode}). See activity log."
+        tail = " / ".join(list(tail_buf)[-3:])[:220]
+        msg = saw_error or (f"Download failed (exit {proc.returncode}): {tail}"
+                            if tail else f"Download failed (exit {proc.returncode}). See activity log.")
         _set_dl(_jid=jid, active=False, status="error", error=msg, detail=msg)
         log_line(f"[download] FAILED {model}: {msg}")
         return
@@ -1621,10 +1659,19 @@ def preload_check(model: str) -> dict:
     # engine routing note
     engine = engine_decision["engine"]
     notes.append(engine_decision["reason"])
-    # known-risky formats, only a concern on vLLM
+    # vLLM safetensors that aren't a DFlash pair need the multi-node cluster up
     low = model.lower()
+    has_dflash = bool(dflash_draft_for(model))
+    if engine == "vllm":
+        if has_dflash:
+            notes.append("Has a DFlash draft: serves single-node with speculative decoding (no cluster needed).")
+        elif CONTAINER not in _running_container_names():
+            warnings.append("The multi-node vLLM cluster isn't running. Start it first or this load will fail. "
+                            "(GGUF models run single-node on llama.cpp without the cluster.)")
+    # known-risky formats, only a concern on vLLM
     if engine == "vllm" and ("nvfp4" in low or "fp4" in low):
-        warnings.append("NVFP4 format isn't supported by vLLM yet. Will likely fail. If a GGUF version exists, it runs on llama.cpp instead.")
+        warnings.append("NVFP4 is a newer 4-bit format; this vLLM build may not support it. "
+                        "If the load fails, check Engine Logs, or use a GGUF/FP8 build of the model instead.")
     if engine == "llamacpp" and not is_cached:
         notes.append("GGUF will download on first load.")
     return {
@@ -1637,18 +1684,27 @@ def preload_check(model: str) -> dict:
 
 
 def unload_model():
-    """Stop vLLM serving (frees memory). Cluster/Ray stays up."""
+    """Stop ALL serving and return the box to a neutral state, so the next load can be
+    a completely different model on a completely different engine. Tears down every
+    serving path (multi-node vLLM serve, single-node vLLM+DFlash, llama.cpp), clears
+    the saved serving state, and drops page caches to free the shared UMA. The Ray
+    cluster container itself (if up) stays up; only the served model is stopped."""
     with _download_lock:
         if _download["active"]:
             return {"ok": False, "detail": "A job is running; use Cancel to stop it first."}
-    rc, _, _ = run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
-    # also tear down the single-node vLLM+DFlash container if it's the one serving
+    # multi-node vLLM serve (only if the cluster container exists)
+    if CONTAINER in _running_container_names():
+        run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
+    # single-node engines run as their own containers; remove them outright
     run(["docker", "rm", "-f", DFLASH_CONTAINER], timeout=20)
+    run(["docker", "rm", "-f", LLAMA_CONTAINER], timeout=20)
     clear_serving_state()   # explicit stop: don't let the watchdog resurrect it
+    # free the shared CPU/GPU memory so the next (possibly larger) model has room
+    _sudo(["sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"])
     _set_dl(active=False, status="idle", model=None, percent=0, detail="", error=None)
     invalidate_cache("library", "engine_active", "status", "metrics")
-    log_line("[model] unloaded (vLLM serve stopped)")
-    return {"ok": True, "detail": "Model unloaded. Memory freed. Load one to resume serving."}
+    log_line("[model] unloaded all engines; box is idle and ready for any model/engine")
+    return {"ok": True, "detail": "All engines stopped, memory freed. Ready to load any model on any engine."}
 
 
 def cancel_load():
@@ -1691,10 +1747,22 @@ def dismiss_status():
 
 
 def vllm_logs(lines=120):
-    rc, out, _ = run(["docker", "exec", CONTAINER, "tail", "-n", str(lines), "/var/log/vllm.log"], timeout=10)
-    if rc != 0:
-        return "No vLLM log yet. Container may not be running."
-    return out
+    """Read vLLM logs from whichever vLLM-family container is actually serving.
+    The single-node DFlash container runs vllm as its entrypoint, so its logs go to
+    `docker logs vllm-dflash`; the multi-node cluster container runs vllm via a
+    backgrounded exec that redirects to /var/log/vllm.log inside it. Reading the
+    wrong one is why the panel showed 'No vLLM log yet' while DFlash was serving."""
+    running = _running_container_names()
+    if DFLASH_CONTAINER in running:
+        rc, out, err = run(["docker", "logs", "--tail", str(lines), DFLASH_CONTAINER], timeout=10)
+        combined = "\n".join(p for p in (out, err) if p).strip()
+        return combined or "vLLM+DFlash is running but has produced no log output yet (still loading?)."
+    if CONTAINER in running:
+        rc, out, _ = run(["docker", "exec", CONTAINER, "tail", "-n", str(lines), "/var/log/vllm.log"], timeout=10)
+        if rc == 0:
+            return out
+        return "vLLM cluster container is up but hasn't written /var/log/vllm.log yet."
+    return "No vLLM container is running. Start the cluster, or load a model to begin serving."
 
 
 # ------------------------------------------------------------
