@@ -22,6 +22,20 @@ HF_CACHE="${HF_CACHE:-/home/$(whoami)/hf-cache}"
 GGUF_DIR="${GGUF_DIR:-${HF_CACHE}/gguf}"
 NGL="${LLAMA_NGL:-999}"                    # offload all layers to GPU
 DEFAULT_CTX="${LLAMA_CTX:-32768}"
+# Performance tuning for GB10 / DGX Spark (all overridable via cluster.env). Measured
+# on Qwen3.6-27B Q4_K_M: these lift generation ~9 -> ~11.6 tok/s (the memory-bandwidth
+# ceiling for a dense 27B at ~273 GB/s) and speed up prompt processing. Generation is
+# bandwidth-bound, so to go meaningfully faster use speculative decoding (MTP/DFlash)
+# or a smaller/sparser model, not more flags.
+BATCH="${LLAMA_BATCH:-2048}"               # logical batch
+UBATCH="${LLAMA_UBATCH:-2048}"             # physical micro-batch; bigger = faster prefill
+FLASH_ATTN="${LLAMA_FLASH_ATTN:-on}"       # on|off|auto (required for KV V-cache quant)
+KV_TYPE="${LLAMA_KV_TYPE:-q8_0}"           # KV cache quant (q8_0 = quality-safe); set "none" to disable
+USE_MMAP="${LLAMA_MMAP:-0}"                # 0 -> pass --no-mmap (better on GB10 unified memory)
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY is an oversubscribe/spill mechanism; off by default
+# since models fit in the 128GB unified pool and UVM paging can hurt. Set 1 for models
+# that don't fit on the device.
+UNIFIED_MEM="${LLAMA_UNIFIED_MEMORY:-0}"
 
 log() { printf '\033[0;32m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -79,20 +93,28 @@ docker image inspect "${LLAMA_IMAGE}" >/dev/null 2>&1 || {
 # Clear any prior container
 docker rm -f "${LLAMA_CONTAINER}" 2>/dev/null || true
 
-log "Starting llama.cpp: ${GGUF_FILE} (ctx=${CTX}, ngl=${NGL}) on :${LLAMA_PORT}"
+log "Starting llama.cpp: ${GGUF_FILE} (ctx=${CTX}, ngl=${NGL}, fa=${FLASH_ATTN}, kv=${KV_TYPE:-f16}, ub=${UBATCH}) on :${LLAMA_PORT}"
+
+# Build the perf flag list from the tuning vars above (see comments there).
+LLAMA_ARGS=( -m "/models/${GGUF_FILE}" --host 0.0.0.0 --port "${LLAMA_PORT}"
+             -c "${CTX}" -ngl "${NGL}" -b "${BATCH}" -ub "${UBATCH}" --metrics --jinja )
+[[ "${FLASH_ATTN}" != "off" ]] && LLAMA_ARGS+=( -fa "${FLASH_ATTN}" )
+if [[ -n "${KV_TYPE}" && "${KV_TYPE}" != "none" ]]; then
+    LLAMA_ARGS+=( -ctk "${KV_TYPE}" -ctv "${KV_TYPE}" )   # needs flash-attn for the V side
+fi
+[[ "${USE_MMAP}" == "0" ]] && LLAMA_ARGS+=( --no-mmap )
+
+# Only spill to UVM when explicitly asked; the GB10 pool is already physically unified.
+DOCKER_ENV=()
+[[ "${UNIFIED_MEM}" == "1" ]] && DOCKER_ENV+=( -e GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 )
+
 # The ardge-labs image IS the server; pass model + args directly (no --server flag).
-# GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 is important on GB10's unified memory.
 docker run -d --name "${LLAMA_CONTAINER}" --gpus all \
-    -e GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+    "${DOCKER_ENV[@]}" \
     -v "${GGUF_DIR}:/models" \
     -p "${LLAMA_PORT}:${LLAMA_PORT}" \
     "${LLAMA_IMAGE}" \
-    -m "/models/${GGUF_FILE}" \
-    --host 0.0.0.0 --port "${LLAMA_PORT}" \
-    -c "${CTX}" \
-    -ngl "${NGL}" \
-    --metrics \
-    --jinja
+    "${LLAMA_ARGS[@]}"
 
 # brief check that the container didn't immediately die (bad args, missing file)
 sleep 3
