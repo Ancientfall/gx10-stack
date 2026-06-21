@@ -1,6 +1,6 @@
 # gx10-stack
 
-Setup scripts and a web control panel for a dual ASUS Ascent GX10 (NVIDIA GB10) cluster running distributed vLLM over the ConnectX-7 200G link.
+Setup scripts and a web control panel for a dual ASUS Ascent GX10 (NVIDIA GB10) cluster. Serve models on distributed vLLM over the ConnectX-7 200G link, or single-node — including vLLM + DFlash speculative decoding and llama.cpp for GGUF — all driven from the web panel.
 
 ## Layout
 
@@ -47,11 +47,10 @@ ssh nealasmothers@myspark  'git clone git@github.com:Ancientfall/gx10-stack.git'
 ssh nealasmothers@myspark2 'git clone git@github.com:Ancientfall/gx10-stack.git'
 ```
 
-To pull updates later:
+To pull updates later, one command on the head node pulls both nodes and restarts the panel:
 
 ```bash
-ssh nealasmothers@myspark  'cd gx10-stack && git pull'
-ssh nealasmothers@myspark2 'cd gx10-stack && git pull'
+ssh nealasmothers@myspark 'cd gx10-stack && ./deploy.sh'
 ```
 
 ## Notes
