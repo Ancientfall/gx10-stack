@@ -296,6 +296,74 @@ def _collector_loop(interval=10):
     db_init()
     while not _collector_stop.wait(interval):
         _collect_once()
+        try:
+            _maybe_restore_serving()
+        except Exception as e:
+            log_line(f"[watchdog] error: {e}")
+
+
+# ------------------------------------------------------------
+# Serving state + watchdog. Remember what should be serving so we can bring it
+# back after a crash/reboot if the container restart policy didn't (or the
+# container was removed). Conservative: cooldown + bounded attempts, and it never
+# fights an in-progress job or an explicit stop (which clears the state). All the
+# functions it calls are defined later in the file but only invoked at run time.
+# ------------------------------------------------------------
+SERVING_STATE_FILE = Path(os.environ.get("GX10_STATE_DIR", str(Path.home()))) / ".gx10-serving-state.json"
+_restore = {"attempts": 0, "last": 0.0}
+
+
+def save_serving_state(engine, model, draft=None, repo=None):
+    """Record the intended serving config (called when a load reaches 'serving')."""
+    try:
+        SERVING_STATE_FILE.write_text(json.dumps(
+            {"engine": engine, "model": model, "draft": draft, "repo": repo, "ts": int(time.time())}))
+        _restore["attempts"] = 0
+    except Exception:
+        pass
+
+
+def clear_serving_state():
+    """Forget the intended config (called on explicit stop/unload) so the watchdog
+    won't resurrect a deliberately stopped engine."""
+    _restore["attempts"] = 0
+    try:
+        SERVING_STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _maybe_restore_serving():
+    try:
+        st = json.loads(SERVING_STATE_FILE.read_text())
+    except Exception:
+        return
+    if not st:
+        return
+    if active_engine().get("model"):     # something is serving — all good
+        _restore["attempts"] = 0
+        return
+    with _download_lock:                  # never fight an in-progress load
+        if _download.get("active"):
+            return
+    now = time.time()
+    if now - _restore["last"] < 90 or _restore["attempts"] >= 5:
+        return
+    _restore["last"] = now
+    _restore["attempts"] += 1
+    eng, model = st.get("engine"), st.get("model")
+    log_line(f"[watchdog] nothing serving; restoring {eng}/{model} (attempt {_restore['attempts']}/5)")
+    try:
+        if eng == "dflash":
+            start_dflash(model, st.get("draft") or DFLASH_PAIRS.get(model, ""))
+        elif eng == "llamacpp":
+            start_llama(st.get("repo") or "", model)
+        elif eng == "vllm":
+            route_model(model)
+    except Exception as e:
+        log_line(f"[watchdog] restore failed: {e}")
 
 
 def run(cmd, timeout=20, shell=False, capture_to_activity=False):
@@ -1422,6 +1490,7 @@ def unload_model():
     rc, _, _ = run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     # also tear down the single-node vLLM+DFlash container if it's the one serving
     run(["docker", "rm", "-f", DFLASH_CONTAINER], timeout=20)
+    clear_serving_state()   # explicit stop: don't let the watchdog resurrect it
     _set_dl(active=False, status="idle", model=None, percent=0, detail="", error=None)
     invalidate_cache("library", "engine_active", "status", "metrics")
     log_line("[model] unloaded (vLLM serve stopped)")
@@ -1995,6 +2064,7 @@ def _llama_start_worker(repo: str, gguf_file: str, ctx: int, jid=None):
             _set_dl(_jid=jid, active=False, status="ready", percent=100,
                     detail=f"llama.cpp serving {gguf_file} on :{LLAMA_PORT}.", error=None)
             log_line(f"[llama] {gguf_file} is serving")
+            save_serving_state("llamacpp", gguf_file, repo=repo)
             invalidate_cache("engine_active", "library")
             return
         time.sleep(2)
@@ -2019,6 +2089,7 @@ def start_llama(repo: str, gguf_file: str, ctx: int = 32768):
 def stop_llama():
     script = str(KIT_DIR / "llama-serve.sh")
     run(["bash", script, "stop"], timeout=20)
+    clear_serving_state()
     log_line("[llama] stopped")
     return {"ok": True, "detail": "llama.cpp server stopped."}
 
@@ -2060,6 +2131,7 @@ def _dflash_start_worker(model: str, draft: str, jid=None):
             _set_dl(_jid=jid, active=False, status="ready", percent=100,
                     detail=f"vLLM+DFlash serving {model}.", error=None)
             log_line(f"[dflash] {model} is serving")
+            save_serving_state("dflash", model, draft=draft)
             invalidate_cache("engine_active", "library")
             return
         time.sleep(3)
@@ -2082,6 +2154,7 @@ def start_dflash(model: str, draft: str):
 def stop_dflash():
     script = str(KIT_DIR / "vllm-dflash-serve.sh")
     run(["bash", script, "stop"], timeout=30)
+    clear_serving_state()
     log_line("[dflash] stopped")
     return {"ok": True, "detail": "vLLM+DFlash stopped."}
 

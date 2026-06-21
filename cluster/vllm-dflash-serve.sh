@@ -55,6 +55,12 @@ SPEC_CONFIG=$(printf '{"method":"dflash","model":"%s","num_speculative_tokens":%
 
 EXTRA=()
 [[ "${TRUST_REMOTE}" == "1" ]] && EXTRA+=( --trust-remote-code )
+# optional weight quantization (DFLASH_QUANT=fp8 -> Blackwell-native FP8, ~half the
+# bytes/token). NOTE: tested 2026-06-21 and FP8 currently BREAKS with DFlash on this
+# vLLM build (0.20.1+dev) — torch.compile can't pickle the FP8 graph ("Can't pickle
+# <function launcher>"), so the engine crash-loops. Leave UNSET (BF16) until a newer
+# vLLM fixes it; --enforce-eager would sidestep it but loses CUDA-graph speed.
+[[ -n "${DFLASH_QUANT:-}" ]] && EXTRA+=( --quantization "${DFLASH_QUANT}" )
 
 # Persist the vLLM torch.compile / CUDA-graph cache on the host so reloads skip the
 # ~70s recompile, and keep server logs on the host so a crashed container is debuggable.
