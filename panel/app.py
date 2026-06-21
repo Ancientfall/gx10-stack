@@ -918,6 +918,42 @@ def gather_metrics() -> dict:
     return out
 
 
+def compute_alerts() -> list:
+    """Threshold rules over the latest metrics, surfaced as actionable warnings.
+    The collector already gathers temp / memory / KV-cache / queue depth — this just
+    flags them so the panel proactively warns about thermal throttle, OOM risk, KV
+    saturation, and queue build-up instead of you having to watch the gauges."""
+    out = []
+    try:
+        m = cached("metrics", 1.5, gather_metrics)
+    except Exception:
+        return out
+    nodes = m.get("nodes", {}) or {}
+    for role in ("head", "worker"):
+        n = nodes.get(role) or {}
+        temp = n.get("temp")
+        if isinstance(temp, (int, float)):
+            if temp >= 90:
+                out.append({"level": "error", "msg": f"{role} GPU at {int(temp)}°C — thermal throttling likely; reduce load."})
+            elif temp >= 84:
+                out.append({"level": "warn", "msg": f"{role} GPU running hot ({int(temp)}°C)."})
+        mu, mt = n.get("mem_used"), n.get("mem_total")
+        if isinstance(mu, (int, float)) and isinstance(mt, (int, float)) and mt > 0:
+            pct = mu / mt * 100
+            if pct >= 96:
+                out.append({"level": "error", "msg": f"{role} memory {pct:.0f}% — OOM risk; unload or pick a smaller model."})
+            elif pct >= 91:
+                out.append({"level": "warn", "msg": f"{role} memory tight ({pct:.0f}%)."})
+    s = m.get("serving", {}) or {}
+    kv = s.get("kv_cache_pct")
+    if isinstance(kv, (int, float)) and kv >= 90:
+        out.append({"level": "warn", "msg": f"KV cache {int(kv)}% — near capacity; lower concurrency or max-model-len."})
+    waiting = s.get("requests_waiting")
+    if isinstance(waiting, (int, float)) and waiting >= 1:
+        out.append({"level": "warn", "msg": f"{int(waiting)} request(s) queued — the engine is saturated."})
+    return out
+
+
 def gather_status() -> dict:
     c = cfg()
     checks = [
@@ -944,6 +980,7 @@ def gather_status() -> dict:
         "running": running,
         "action": _current_action["name"],
         "checks": checks,
+        "alerts": compute_alerts(),
         "nodes": {
             "head": {"ip": c["HEAD_IP"], "iface": c.get("CX7_IFACE", "")},
             "worker": {"ip": c["WORKER_IP"], "host": c["WORKER_SSH_HOST"]},
@@ -1772,13 +1809,13 @@ def vllm_logs(lines=120):
 
 # Curated GB10-friendly models. Edit freely. params_b = billions of params.
 CURATED_MODELS = [
-    {"id": "openai/gpt-oss-120b", "params_b": 120, "note": "MoE, mxfp4. Strong general + reasoning.", "gated": False},
-    {"id": "openai/gpt-oss-20b", "params_b": 20, "note": "Smaller gpt-oss. Fast, single-node capable.", "gated": False},
-    {"id": "Qwen/Qwen3-72B-Instruct", "params_b": 72, "note": "Strong all-rounder, long context.", "gated": False},
-    {"id": "Qwen/Qwen3-32B", "params_b": 32, "note": "Fast, fits comfortably.", "gated": False},
-    {"id": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "params_b": 30, "note": "MoE coder, low active params.", "gated": False},
-    {"id": "meta-llama/Llama-3.3-70B-Instruct", "params_b": 70, "note": "Meta flagship. Needs HF token.", "gated": True},
-    {"id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506", "params_b": 24, "note": "Efficient, capable.", "gated": False},
+    {"id": "openai/gpt-oss-120b", "params_b": 120, "use": "reasoning", "note": "MoE, mxfp4. Strong general + reasoning.", "gated": False},
+    {"id": "openai/gpt-oss-20b", "params_b": 20, "use": "general", "note": "Smaller gpt-oss. Fast, single-node capable.", "gated": False},
+    {"id": "Qwen/Qwen3-72B-Instruct", "params_b": 72, "use": "general", "note": "Strong all-rounder, long context.", "gated": False},
+    {"id": "Qwen/Qwen3-32B", "params_b": 32, "use": "general", "note": "Fast, fits comfortably.", "gated": False},
+    {"id": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "params_b": 30, "use": "coding", "note": "MoE coder, low active params.", "gated": False},
+    {"id": "meta-llama/Llama-3.3-70B-Instruct", "params_b": 70, "use": "general", "note": "Meta flagship. Needs HF token.", "gated": True},
+    {"id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506", "params_b": 24, "use": "general", "note": "Efficient, capable.", "gated": False},
 ]
 
 # Pooled memory budget across both GB10s (GB). 128 each, reserve headroom.
@@ -2142,12 +2179,24 @@ def toggle_favorite(model: str) -> dict:
 
 
 def curated_models() -> list:
+    """Curated list as a hardware-aware advisor: each model gets a fit label for this
+    box's pooled/single-node memory, a 'recommended' flag (fits without needing a
+    token you may not have), and we sort the best picks first (recommended, then
+    smallest-footprint/fastest)."""
     cached = {m["id"] for m in hf_cache_models()}
+    have_token = bool(cfg().get("HF_TOKEN"))
     current = cfg().get("MODEL", "")
     result = []
     for m in CURATED_MODELS:
         fit = _fit_label(m["params_b"])
-        result.append({**m, **fit, "cached": m["id"] in cached, "active": m["id"] == current})
+        is_cached = m["id"] in cached
+        # recommended = it will actually run here and you can fetch it
+        recommended = fit["fit"] != "toobig" and (not m.get("gated") or have_token or is_cached)
+        result.append({**m, **fit, "cached": is_cached, "active": m["id"] == current,
+                       "recommended": recommended})
+    fit_rank = {"single": 0, "cluster": 1, "unknown": 2, "toobig": 3}
+    result.sort(key=lambda r: (not r["recommended"], fit_rank.get(r["fit"], 2),
+                               r.get("footprint_gb") or 9999))
     return result
 
 
