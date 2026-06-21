@@ -2817,20 +2817,25 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def _pick_port(preferred: int, host: str) -> int:
-    """Bind the preferred port, or the next free fallback if it's taken (e.g. the
-    systemd unit hands us 8080 but Open WebUI already has it). Keeps the panel from
-    crash-looping on a port conflict and logs where it actually landed."""
-    import socket
+    """Bind a stable panel port. 8080 is skipped (Open WebUI's default and the old
+    systemd template default), so the panel lands on a fixed 8090 instead of crash-
+    looping on the collision. The top choice is retried briefly to ride out the socket
+    release during a service restart, so the port stays stable across restarts."""
+    import socket, time
     bind_host = "" if host in ("0.0.0.0", "::", "") else host
-    for p in dict.fromkeys([preferred, 8090, 8091, 8092, 8190]):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind((bind_host, p))
-            s.close()
-            return p
-        except OSError:
-            s.close()
-    return preferred
+    candidates = [p for p in dict.fromkeys([preferred, 8090, 8091, 8092]) if p != 8080] or [8090]
+    for i, p in enumerate(candidates):
+        for _ in range(6 if i == 0 else 1):   # retry only the preferred port
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((bind_host, p))
+                s.close()
+                return p
+            except OSError:
+                s.close()
+                time.sleep(0.4)
+    return candidates[0]
 
 
 if __name__ == "__main__":
