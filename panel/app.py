@@ -1458,8 +1458,10 @@ def cancel_pure_download() -> dict:
     return {"ok": True, "detail": "Background download cancelled."}
 
 
-def _start_vllm(model: str, max_len_override: int = None) -> tuple:
-    """Relaunch vLLM serve in the running container with the given model."""
+def _start_vllm(model: str, max_len_override: int = None, batched_override: int = None) -> tuple:
+    """Relaunch vLLM serve in the running container with the given model. Optional
+    overrides for max-model-len and max-num-batched-tokens let the watcher
+    auto-correct context length and multimodal token budgets on a failed first try."""
     model = _validate_hf_repo_id(model, "model")
     c = cfg()
     port = _validate_int_range(c["API_PORT"], "API_PORT", 1, 65535)
@@ -1472,14 +1474,18 @@ def _start_vllm(model: str, max_len_override: int = None) -> tuple:
                          "Check the activity log, or pick a GGUF model to run single-node on llama.cpp.")
     run(["docker", "exec", CONTAINER, "pkill", "-f", "vllm serve"], timeout=10)
     time.sleep(2)
+    extra, args = "", ["vllm-serve", model, port, tp, gpu_util, max_len]
+    if batched_override:
+        batched = _validate_int_range(batched_override, "MAX_NUM_BATCHED_TOKENS", 256, 1048576)
+        extra = '--max-num-batched-tokens "$6" '
+        args.append(batched)
     serve = (
         'exec vllm serve "$1" --host 0.0.0.0 --port "$2" '
         '--tensor-parallel-size "$3" --distributed-executor-backend ray '
         '--gpu-memory-utilization "$4" --max-model-len "$5" '
-        '> /var/log/vllm.log 2>&1'
+        f'{extra}> /var/log/vllm.log 2>&1'
     )
-    return run(["docker", "exec", "-d", CONTAINER, "bash", "-lc", serve,
-                "vllm-serve", model, port, tp, gpu_util, max_len], timeout=15)
+    return run(["docker", "exec", "-d", CONTAINER, "bash", "-lc", serve] + args, timeout=15)
 
 
 def _explain_error(log: str) -> str:
@@ -1505,7 +1511,7 @@ def _explain_error(log: str) -> str:
     return "Engine failed to start. See vLLM logs for details."
 
 
-def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, jid=None) -> bool:
+def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _attempt=0, jid=None) -> bool:
     """Poll until the model serves (return True) or fails (return False)."""
     c = cfg()
     port = c["API_PORT"]
@@ -1529,22 +1535,34 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, j
                     return True
             except Exception:
                 pass
-        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "40", "/var/log/vllm.log"], timeout=8)
+        rc2, log, _ = run(["docker", "exec", CONTAINER, "tail", "-n", "120", "/var/log/vllm.log"], timeout=8)
         if rc2 == 0 and log:
             low = log.lower()
-            # auto-correct context length once
+            # auto-correct context length: vLLM rejects a max-model-len above the model's cap
             mlen = re.search(r"derived max_model_len \(max_position_embeddings=(\d+)", log)
-            if mlen and not _retried:
+            if mlen and _attempt < 3:
                 real_max = int(mlen.group(1))
+                _model_maxlen_cache[model] = real_max
                 log_line(f"[model] {model} caps context at {real_max}; retrying")
                 _set_dl(_jid=jid, active=True, status="loading",
                         detail=f"{model} max context is {real_max}, retrying...")
-                _start_vllm(model, max_len_override=real_max)
-                _model_maxlen_cache[model] = real_max
-                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _retried=True, jid=jid)
+                _start_vllm(model, max_len_override=real_max, batched_override=_model_batched_cache.get(model))
+                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _attempt=_attempt + 1, jid=jid)
+            # auto-correct multimodal token budget: vision models (e.g. Gemma) need
+            # max-num-batched-tokens >= their per-image token count.
+            mmb = re.search(r"max_tokens_per_mm_item \((\d+)\) is larger than max_num_batched_tokens", log)
+            if mmb and _attempt < 3:
+                newb = max(int(mmb.group(1)), 4096)
+                _model_batched_cache[model] = newb
+                log_line(f"[model] {model} needs max_num_batched_tokens>={mmb.group(1)}; retrying with {newb}")
+                _set_dl(_jid=jid, active=True, status="loading",
+                        detail=f"{model}: adjusting batch tokens to {newb}, retrying...")
+                _start_vllm(model, max_len_override=_model_maxlen_cache.get(model), batched_override=newb)
+                return _watch_vllm_until_ready(model, timeout_s=timeout_s, _attempt=_attempt + 1, jid=jid)
             # fatal error?
             if ("engine core initialization failed" in low or "traceback (most recent call last)" in low
-                    or "raise runtimeerror" in low):
+                    or "raise runtimeerror" in low or "valueerror" in low or "assertionerror" in low
+                    or "engine core proc" in low or "failed to start" in low):
                 reason = _explain_error(log)
                 _set_dl(_jid=jid, active=False, status="error", error=reason, detail=reason)
                 log_line(f"[model] load FAILED: {reason}")
@@ -1553,6 +1571,17 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, j
                 phase = "compiling"
             elif "loading safetensors" in low or "loading weights" in low:
                 phase = "loading weights"
+        # crash detection: if the serve process is gone and nothing is serving, the
+        # load died (catches errors that scrolled past the log window). Fail fast
+        # with the real reason instead of polling until the 20-min timeout.
+        if time.time() - start > 12:
+            rcp, procs, _ = run(["docker", "exec", CONTAINER, "pgrep", "-f", "vllm serve"], timeout=6)
+            if not (rcp == 0 and (procs or "").strip()):
+                reason = _explain_error(log if rc2 == 0 else "") or \
+                    "vLLM exited during load — check the Engine Logs for the error."
+                _set_dl(_jid=jid, active=False, status="error", error=reason, detail=reason)
+                log_line(f"[model] load FAILED (vLLM process exited): {reason}")
+                return False
         elapsed = int(time.time() - start)
         _set_dl(_jid=jid, active=True, status=phase, detail=f"{model}: {phase} ({elapsed}s)")
         time.sleep(5)
@@ -1561,8 +1590,10 @@ def _watch_vllm_until_ready(model: str, timeout_s: int = 1200, _retried=False, j
     return False
 
 
-# remembers per-model context caps discovered via auto-correction
+# remembers per-model caps discovered via auto-correction (context length, and the
+# multimodal batched-token budget that vision models like Gemma need)
 _model_maxlen_cache = {}
+_model_batched_cache = {}
 
 
 def _running_container_names() -> set:
@@ -1674,7 +1705,7 @@ def _download_worker(model: str, auto_load: bool, jid=None):
         log_line(f"[model] auto-loading {model}")
         if not _ensure_cluster_up(jid):   # auto-provision the cluster if it isn't up
             return
-        rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
+        rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model), _model_batched_cache.get(model))
         if rc != 0:
             _set_dl(_jid=jid, active=False, status="error", error=f"Load failed: {err}")
             return
@@ -1768,7 +1799,7 @@ def _load_worker(model: str, jid=None):
         if not previous:
             write_env_value(CLUSTER_ENV, "MODEL", "")
         return
-    rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model))
+    rc, _, err = _start_vllm(model, _model_maxlen_cache.get(model), _model_batched_cache.get(model))
     if rc != 0:
         if not previous:
             write_env_value(CLUSTER_ENV, "MODEL", "")
@@ -1788,7 +1819,7 @@ def _load_worker(model: str, jid=None):
                 detail=f"Load failed. Rolling back to {previous}...",
                 error=cur.get("error"))
         write_env_value(CLUSTER_ENV, "MODEL", previous)
-        rc2, _, _ = _start_vllm(previous, _model_maxlen_cache.get(previous))
+        rc2, _, _ = _start_vllm(previous, _model_maxlen_cache.get(previous), _model_batched_cache.get(previous))
         if rc2 == 0 and _watch_vllm_until_ready(previous, jid=jid):
             _set_dl(_jid=jid, active=False, status="error",
                     error=f"{model} failed to load. Rolled back to {previous}.",
